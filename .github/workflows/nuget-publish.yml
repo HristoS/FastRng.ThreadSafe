@@ -35,9 +35,12 @@ jobs:
     - name: Pack Library to NuGet Structure
       run: dotnet pack src/ThreadSafeCascadeGenerator.csproj --configuration Release --output ./artifacts
  
-    # Use the native GitHub login action to prime the NuGet Trusted Publishing token handler
+    # Step 1: Exchange OIDC Token for a temporary NuGet API Key
     - name: NuGet Login
       uses: nuget/login@v1
+      id: oidc_login
+      with:
+        user: 'HristoS' # Must match your exact 
 
     - name: Publish to NuGet
-      run: dotnet nuget push "./artifacts/*.nupkg" --source https://api.nuget.org/v3/index.json --skip-duplicate
+      run: dotnet nuget push "./artifacts/*.nupkg" --source https://api.nuget.org/v3/index.json --api-key ${{ steps.oidc_login.outputs.nuget-api-key }} --skip-duplicate

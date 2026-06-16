@@ -10,7 +10,7 @@
     <Authors>Hristo Stoew</Authors>
     <Description>Highperformance cascade RNG generator, bases on 6-layers dinamick permutations for .NET 10 </Description>
     <PackageTags>random;rng;cascade;thread-safe;performance</PackageTags>
-    <RepositoryUrl>https://github.com</RepositoryUrl>
+    <RepositoryUrl>https://github.com/HristoS/ThreadSafeCascadeGenerator</RepositoryUrl>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
   </PropertyGroup>
 </Project>
