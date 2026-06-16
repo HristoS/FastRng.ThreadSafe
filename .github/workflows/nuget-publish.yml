@@ -34,6 +34,10 @@ jobs:
 
     - name: Pack Library to NuGet Structure
       run: dotnet pack src/ThreadSafeCascadeGenerator.csproj --configuration Release --output ./artifacts
+ 
+    # Use the native GitHub login action to prime the NuGet Trusted Publishing token handler
+    - name: NuGet Login
+      uses: nuget/login@v1
 
-    - name: Push Package to NuGet.org
-      run: dotnet nuget push "./artifacts/*.nupkg" --source https://api.nuget.org/v3/index.json --api-key OIDC --skip-duplicate
+    - name: Publish to NuGet
+      run: dotnet nuget push "./artifacts/*.nupkg" --source https://api.nuget.org/v3/index.json --skip-duplicate
