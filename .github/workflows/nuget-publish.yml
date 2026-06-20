@@ -4,7 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*' # Triggers automatically when you push a version tag like v1.0.3
-
+  workflow_dispatch:
+    inputs:
+      manual_version:
+        description: 'Version (e.g., 1.0.5)'
+        required: false
+        type: string
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
@@ -30,9 +35,14 @@ jobs:
       - name: Run Unit Tests
         run: dotnet test --configuration Release --no-build --verbosity normal
 
-      - name: Extract Version From Tag
+      - name: Extract Version
         id: get_version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: |
+          if [ -n "${{ github.event.inputs.manual_version }}" ]; then
+            echo "VERSION=${{ github.event.inputs.manual_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Pack NuGet Package
         run: |
