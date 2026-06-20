@@ -6,8 +6,12 @@ on:
       - 'v*.*.*' # Triggers automatically when you push a version tag like v1.0.3
 
 jobs:
-  build-and-test:
+  build-and-publish:
     runs-on: ubuntu-latest
+    environment: production # Connects to your NuGet production environment
+    permissions:
+      id-token: write # Mandatory permission token for secure passwordless login
+      contents: read
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -25,22 +29,6 @@ jobs:
 
       - name: Run Unit Tests
         run: dotnet test --configuration Release --no-build --verbosity normal
-
-  publish-nuget:
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    environment: production # Connects to your NuGet production environment
-    permissions:
-      id-token: write # Mandatory permission token for secure passwordless login
-      contents: read
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
 
       - name: Extract Version From Tag
         id: get_version
