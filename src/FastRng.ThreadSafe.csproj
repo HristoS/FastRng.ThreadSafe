@@ -21,6 +21,7 @@
     <!-- Include symbols in a separate snupkg or embed them directly -->
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DebugType>portable</DebugType>
 
      <!-- Forces compilation to include the ReadMe file on NuGet -->
     <PackageReadmeFile>ReadMe.md</PackageReadmeFile>
