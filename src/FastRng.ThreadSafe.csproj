@@ -17,11 +17,16 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
+
+    <!-- Include symbols in a separate snupkg or embed them directly -->
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
 
      <!-- Forces compilation to include the ReadMe file on NuGet -->
     <PackageReadmeFile>ReadMe.md</PackageReadmeFile>
+
+    <!-- Deterministic builds for Source Link -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <ItemGroup>
