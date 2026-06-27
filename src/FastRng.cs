@@ -19,7 +19,7 @@ public class FastRng : Random
 
     private const uint ReSeedInterval = 65536;// Re-seed threshold after generating 64KB
     private const int MetadataSize = 4;
-    private const int MatrixSize = 5 * 256; // Reduced to 5 layers
+    private const int MatrixSize = 4 * 256; // Reduced to 5 layers
     private const int TotalStateSize = MetadataSize + MatrixSize; // 1284 bytes
 
     /// <summary>
@@ -69,7 +69,7 @@ public class FastRng : Random
         (Unsafe.Add(ref stateRef, MetadataSize + localI), Unsafe.Add(ref stateRef, MetadataSize + localJ)) =
         (Unsafe.Add(ref stateRef, MetadataSize + localJ), Unsafe.Add(ref stateRef, MetadataSize + localI));
 
-        int targetLevels = 3 + ((localI + localJ) % 3); // Dynamic depths adjusted for 5 layers max
+        int targetLevels = 3 + ((localI + localJ) & 1); // Range 3-4
         int currentIndexForLevel = (Unsafe.Add(ref stateRef, MetadataSize + localI) + Unsafe.Add(ref stateRef, MetadataSize + localJ)) & 255;
         byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
 
@@ -77,7 +77,7 @@ public class FastRng : Random
         for (uint step = 1; step < targetLevels; step++)
         {
             // Fast bit-masking if applicable, or highly optimized arithmetic
-            int currentArrayIdx = (int)((step + (userValue & 3)) % 5); // Modified userValue % 4 -> & 3
+            int currentArrayIdx = (int)((step + (userValue & 3)) & 3);  // Modified userValue % 4 -> & 3
             int levelOffset = MetadataSize + (currentArrayIdx << 8);
 
             int lvlJ = (currentIndexForLevel + localI + (int)step) & 255;
@@ -102,7 +102,7 @@ public class FastRng : Random
 
         for (int step = targetLevels - 1; step >= 0; step--)
         {
-            int currentArrayIdx = (int)((step + (erasureByte % 3)) % 5);
+            int currentArrayIdx = (int)((step + (erasureByte & 3)) & 3);
             int levelOffset = MetadataSize + (currentArrayIdx << 8);
 
             int reverseI = (currentIndexForLevel ^ erasureByte) & 255;
@@ -182,7 +182,7 @@ public class FastRng : Random
                 baseLvlI = baseLvlJ;
                 baseLvlJ = baseTemp;
 
-                int targetLevels = 3 + ((localI + localJ) % 3);
+                int targetLevels = 3 + ((localI + localJ) & 1); // Range 3-4
                 int currentIndexForLevel = (baseLvlI + baseLvlJ) & 255;
                 byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
 
@@ -190,9 +190,7 @@ public class FastRng : Random
                 for (uint step = 1; step < targetLevels; step++)
                 {
                     // Optimized Array Selector modulo replacement logic
-                    int currentArrayIdx = (int)(step + (userValue & 3));
-                    if (currentArrayIdx >= 5) currentArrayIdx -= 5;
-                    if (currentArrayIdx >= 5) currentArrayIdx -= 5; // Double bounds guard without branching stalls
+                    int currentArrayIdx = (int)((step + (userValue & 3)) & 3);
 
                     int levelOffset = MetadataSize + (currentArrayIdx << 8);
                     int lvlJ = (currentIndexForLevel + localI + (int)step) & 255;
@@ -218,8 +216,7 @@ public class FastRng : Random
 
                 for (int step = targetLevels - 1; step >= 0; step--)
                 {
-                    int currentArrayIdx = (int)(step + (erasureByte % 3));
-                    if (currentArrayIdx >= 5) currentArrayIdx -= 5;
+                    int currentArrayIdx = (int)((step + (erasureByte & 3)) & 3);
 
                     int levelOffset = MetadataSize + (currentArrayIdx << 8);
                     int reverseI = (currentIndexForLevel ^ erasureByte) & 255;
@@ -450,7 +447,7 @@ public class FastRng : Random
         ref byte matrixRef = ref MemoryMarshal.GetReference((Span<byte>)state);
 
         // 1. Map identity sequences (0 to 255) to all 5 layers safely
-        for (int layer = 0; layer < 5; layer++)
+        for (int layer = 0; layer < 4; layer++)
         {
             int offset = MetadataSize + (layer << 8);
             for (int val = 0; val < 256; val++)
