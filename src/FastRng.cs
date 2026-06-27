@@ -71,7 +71,7 @@ public class FastRng : Random
         baseLvlI = baseLvlJ;
         baseLvlJ = baseTemp;
 
-        int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 11);
+        int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 15);
 
         int currentIndexForLevel = (baseLvlI + baseLvlJ) & 255;
         byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
@@ -194,7 +194,7 @@ public class FastRng : Random
 
                 byte baseTemp = baseLvlI; baseLvlI = baseLvlJ; baseLvlJ = baseTemp;
 
-                int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 11);
+                int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 15);
                 int currentIndexForLevel = (baseLvlI + baseLvlJ) & 255;
                 byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
 
