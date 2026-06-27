@@ -19,7 +19,7 @@ public class FastRng : Random
 
     private const uint ReSeedInterval = 65536;// Re-seed threshold after generating 64KB
     private const int MetadataSize = 4;
-    private const int MatrixSize = 4 * 256; // Reduced to 4 layers
+    private const int MatrixSize = 16 * 256; // Reduced to 4 layers
     private const int TotalStateSize = MetadataSize + MatrixSize; // 1284 bytes
 
     /// <summary>
@@ -58,71 +58,91 @@ public class FastRng : Random
         byte[] state = GetOrCreateState();
         ref byte stateRef = ref MemoryMarshal.GetReference((Span<byte>)state);
 
-        // Safely extract metadata indices directly via pointer offsets
-        int localI = (Unsafe.Add(ref stateRef, 0) + 1) & 255;
-        int localJ = (Unsafe.Add(ref stateRef, 1) + Unsafe.Add(ref stateRef, MetadataSize + localI)) & 255;
+        int localI = Unsafe.Add(ref stateRef, 0);
+        int localJ = Unsafe.Add(ref stateRef, 1);
+        ushort count = Unsafe.As<byte, ushort>(ref Unsafe.Add(ref stateRef, 2));
 
-        // Increment the count stored at positions 2 and 3
-        Unsafe.As<byte, ushort>(ref Unsafe.Add(ref stateRef, 2))++;
+        localI = (localI + 1) & 255;
+        ref byte baseLvlI = ref Unsafe.Add(ref stateRef, MetadataSize + localI);
+        localJ = (localJ + baseLvlI) & 255;
+        ref byte baseLvlJ = ref Unsafe.Add(ref stateRef, MetadataSize + localJ);
 
-        // Base Layer Swapping
-        (Unsafe.Add(ref stateRef, MetadataSize + localI), Unsafe.Add(ref stateRef, MetadataSize + localJ)) =
-        (Unsafe.Add(ref stateRef, MetadataSize + localJ), Unsafe.Add(ref stateRef, MetadataSize + localI));
+        byte baseTemp = baseLvlI;
+        baseLvlI = baseLvlJ;
+        baseLvlJ = baseTemp;
 
-        int targetLevels = 3 + ((localI + localJ) & 1); // Range 3-4
-        int currentIndexForLevel = (Unsafe.Add(ref stateRef, MetadataSize + localI) + Unsafe.Add(ref stateRef, MetadataSize + localJ)) & 255;
+        int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 11);
+
+        int currentIndexForLevel = (baseLvlI + baseLvlJ) & 255;
         byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
 
-        // Forward Cascade Loops across the remaining layers
-        for (uint step = 1; step < targetLevels; step++)
+        // --- 1. Forward Cascade Loop ---
+        for (int step = 1; step < dynamicLevels; step++)
         {
-            // Fast bit-masking if applicable, or highly optimized arithmetic
-            //int currentArrayIdx = (int)((step + (userValue & 3)) & 3);  // Modified userValue % 4 -> & 3
-            int levelOffset = MetadataSize + (int)(((step << 8) + (userValue << 8)) & 0x300);
+            int targetLayer = (step ^ localI ^ userValue) & 15;
+            int levelOffset = MetadataSize + (targetLayer << 8);
 
-            int lvlJ = (currentIndexForLevel + localI + (int)step) & 255;
+            // Non-linear forward index mapping
+            int lvlJ = (currentIndexForLevel ^ localI ^ (step * 59)) & 255;
 
-            // Use a single local variable cache for the swap to maximize CPU register utilization
             ref byte refI = ref Unsafe.Add(ref stateRef, levelOffset + currentIndexForLevel);
             ref byte refJ = ref Unsafe.Add(ref stateRef, levelOffset + lvlJ);
 
-            byte temp = refI;
-            refI = refJ;
-            refJ = temp;
-
-            int finalIndex = (refI + refJ) & 255;
-            userValue = Unsafe.Add(ref stateRef, levelOffset + finalIndex);
+            byte temp = refI; refI = refJ; refJ = temp;
+            userValue = Unsafe.Add(ref stateRef, levelOffset + ((refI + refJ) & 255));
             currentIndexForLevel = userValue;
         }
 
-        // Fast-Key-Erasure Reverse Scrambling (Inlined & Zero Allocation)
+        // --- 2. Fast-Key-Erasure Reverse Scrambling Pass (Asymmetric Bit-Shift Mix) ---
         int secretI = (localI + 1) & 255;
         int secretJ = (localJ ^ userValue) & 255;
         byte erasureByte = Unsafe.Add(ref stateRef, MetadataSize + ((secretI + secretJ) & 255));
 
-        for (int step = targetLevels - 1; step >= 0; step--)
+        for (int step = dynamicLevels - 1; step >= 0; step--)
         {
-            //int currentArrayIdx = (int)((step + (erasureByte & 3)) & 3);
-            int levelOffset = MetadataSize + (int)(((step << 8) + (userValue << 8)) & 0x300);
+            // PHASE SHIFT MIX: Bitwise inversion (~step) coupled with a separate prime layer shift
+            int targetLayer = (~step ^ localJ ^ erasureByte ^ 7) & 15;
+            int levelOffset = MetadataSize + (targetLayer << 8);
 
+            // RADICAL DE-CORRELATION: Incorporating bit-shifted variations of localJ and step
+            // completely breaks up structural alignments on a cold boot initialization.
             int reverseI = (currentIndexForLevel ^ erasureByte) & 255;
-            int reverseJ = (reverseI + localJ) & 255;
+            int reverseJ = (reverseI + localJ + (step * 101) + ((localJ >> 2) ^ 0xAA)) & 255;
 
             ref byte refRevI = ref Unsafe.Add(ref stateRef, levelOffset + reverseI);
             ref byte refRevJ = ref Unsafe.Add(ref stateRef, levelOffset + reverseJ);
 
-            byte temp = refRevI;
-            refRevI = refRevJ;
-            refRevJ = temp;
-
+            byte temp = refRevI; refRevI = refRevJ; refRevJ = temp;
             erasureByte = (byte)(refRevI ^ reverseJ);
         }
 
-        // Save metadata registers back to structural indices
-        Unsafe.Add(ref stateRef, 0) = (byte)localI;
-        Unsafe.Add(ref stateRef, 1) = (byte)localJ;
+        // Final output bit-mixer to protect LSB structures
+        byte finalizedMix = (byte)(userValue ^ (userValue >> 4));
+        finalizedMix = (byte)(finalizedMix * 31);
+        byte result = (byte)(finalizedMix ^ (finalizedMix >> 3));
 
-        return userValue;
+        count++;
+        if (count >= ReSeedInterval)
+        {
+            Unsafe.Add(ref stateRef, 0) = (byte)localI;
+            Unsafe.Add(ref stateRef, 1) = (byte)localJ;
+            Unsafe.As<byte, ushort>(ref Unsafe.Add(ref stateRef, 2)) = count;
+
+            state = GetOrCreateState();
+            stateRef = ref MemoryMarshal.GetReference((Span<byte>)state);
+
+            localI = Unsafe.Add(ref stateRef, 0);
+            localJ = Unsafe.Add(ref stateRef, 1);
+            count = 0;
+        }
+        else
+        {
+            Unsafe.Add(ref stateRef, 0) = (byte)localI;
+            Unsafe.Add(ref stateRef, 1) = (byte)localJ;
+            Unsafe.As<byte, ushort>(ref Unsafe.Add(ref stateRef, 2)) = count;
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -156,7 +176,6 @@ public class FastRng : Random
 
                 state = GetOrCreateState();
                 stateRef = ref MemoryMarshal.GetReference((Span<byte>)state);
-
                 localI = Unsafe.Add(ref stateRef, 0);
                 localJ = Unsafe.Add(ref stateRef, 1);
                 count = 0;
@@ -166,8 +185,6 @@ public class FastRng : Random
             Span<byte> chunkBuffer = buffer.Slice(bytesProcessed, chunkLength);
             ref byte bufferRef = ref MemoryMarshal.GetReference(chunkBuffer);
 
-            // HIGH SPEED ENGINE: We generate values directly from the base matrix layer
-            // to max out instruction-level parallelism (ILP) and instruction caches.
             for (int i = 0; i < chunkLength; i++)
             {
                 localI = (localI + 1) & 255;
@@ -175,28 +192,49 @@ public class FastRng : Random
                 localJ = (localJ + baseLvlI) & 255;
                 ref byte baseLvlJ = ref Unsafe.Add(ref stateRef, MetadataSize + localJ);
 
-                // Swap positions in Base Layer
-                byte baseTemp = baseLvlI;
-                baseLvlI = baseLvlJ;
-                baseLvlJ = baseTemp;
+                byte baseTemp = baseLvlI; baseLvlI = baseLvlJ; baseLvlJ = baseTemp;
 
-                // Extract random byte output directly from base matrix mix
-                Unsafe.Add(ref bufferRef, i) = Unsafe.Add(ref stateRef, MetadataSize + ((baseLvlI + baseLvlJ) & 255));
-            }
+                int dynamicLevels = 6 + (((localI ^ localJ) * 9) % 11);
+                int currentIndexForLevel = (baseLvlI + baseLvlJ) & 255;
+                byte userValue = Unsafe.Add(ref stateRef, MetadataSize + currentIndexForLevel);
 
-            // SCRAMBLING PASS: We run the forward & backward multi-layer mixing state changes
-            // ONCE at the end of the chunk to mix layers up and retain the state evolution.
-            int targetLevels = 3 + ((localI + localJ) & 1);
-            int mixIndex = (localI + localJ) & 255;
-            byte mixVal = Unsafe.Add(ref stateRef, MetadataSize + mixIndex);
+                for (int step = 1; step < dynamicLevels; step++)
+                {
+                    int targetLayer = (step ^ localI ^ userValue) & 15;
+                    int levelOffset = MetadataSize + (targetLayer << 8);
+                    int lvlJ = (currentIndexForLevel ^ localI ^ (step * 59)) & 255;
 
-            for (uint step = 1; step < targetLevels; step++)
-            {
-                int levelOffset = MetadataSize + (int)(((step << 8) + (mixVal << 8)) & 0x300);
-                ref byte rI = ref Unsafe.Add(ref stateRef, levelOffset + localI);
-                ref byte rJ = ref Unsafe.Add(ref stateRef, levelOffset + localJ);
-                byte t = rI; rI = rJ; rJ = t;
-                mixVal = Unsafe.Add(ref stateRef, levelOffset + ((rI + rJ) & 255));
+                    ref byte refI = ref Unsafe.Add(ref stateRef, levelOffset + currentIndexForLevel);
+                    ref byte refJ = ref Unsafe.Add(ref stateRef, levelOffset + lvlJ);
+
+                    byte temp = refI; refI = refJ; refJ = temp;
+                    userValue = Unsafe.Add(ref stateRef, levelOffset + ((refI + refJ) & 255));
+                    currentIndexForLevel = userValue;
+                }
+
+                byte finalizedMix = (byte)(userValue ^ (userValue >> 4));
+                finalizedMix = (byte)(finalizedMix * 31);
+                Unsafe.Add(ref bufferRef, i) = (byte)(finalizedMix ^ (finalizedMix >> 3));
+
+                int secretI = (localI + 1) & 255;
+                int secretJ = (localJ ^ userValue) & 255;
+                byte erasureByte = Unsafe.Add(ref stateRef, MetadataSize + ((secretI + secretJ) & 255));
+
+                for (int step = dynamicLevels - 1; step >= 0; step--)
+                {
+                    // Synchronized asymmetric phase updates
+                    int targetLayer = (~step ^ localJ ^ erasureByte ^ 7) & 15;
+                    int levelOffset = MetadataSize + (targetLayer << 8);
+
+                    int reverseI = (currentIndexForLevel ^ erasureByte) & 255;
+                    int reverseJ = (reverseI + localJ + (step * 101) + ((localJ >> 2) ^ 0xAA)) & 255;
+
+                    ref byte refRevI = ref Unsafe.Add(ref stateRef, levelOffset + reverseI);
+                    ref byte refRevJ = ref Unsafe.Add(ref stateRef, levelOffset + reverseJ);
+
+                    byte temp = refRevI; refRevI = refRevJ; refRevJ = temp;
+                    erasureByte = (byte)(refRevI ^ reverseJ);
+                }
             }
 
             count += (ushort)chunkLength;
@@ -411,7 +449,7 @@ public class FastRng : Random
         ref byte matrixRef = ref MemoryMarshal.GetReference((Span<byte>)state);
 
         // 1. Map identity sequences (0 to 255) to all 5 layers safely
-        for (int layer = 0; layer < 4; layer++)
+        for (int layer = 0; layer < 16; layer++)
         {
             int offset = MetadataSize + (layer << 8);
             for (int val = 0; val < 256; val++)
@@ -432,7 +470,7 @@ public class FastRng : Random
         // 3. Perform completely unbiased Fisher-Yates layer shuffling
         // Uses a fast bit-mask to completely bypass modulo remainder bias
         int chaosPointer = 2;
-        for (int layer = 0; layer < 4; layer++)
+        for (int layer = 0; layer < 16; layer++)
         {
             int levelOffset = MetadataSize + (layer << 8);
 
