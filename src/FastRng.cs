@@ -213,11 +213,26 @@ public class FastRng : Random
     /// </summary>
     public override int Next(int minValue, int maxValue)
     {
-        if (minValue > maxValue) throw new ArgumentOutOfRangeException(nameof(minValue), "MinValue must be less than or equal to maxValue.");
+        if (minValue > maxValue)
+            throw new ArgumentOutOfRangeException(nameof(minValue), "MinValue must be less than or equal to maxValue.");
+
         if (minValue == maxValue) return minValue;
 
-        long range = (long)maxValue - minValue;
-        return (int)(minValue + (this.NextDouble() * range));
+        uint range = (uint)(maxValue - minValue);
+        if (range == 1) return minValue;
+
+        // Calculate the rejection boundary to prevent statistical clustering
+        uint limit = uint.MaxValue - (uint.MaxValue % range);
+        uint sample;
+
+        do
+        {
+            // Leverage your ultra-fast 64-bit internal cascade register
+            sample = (uint)(NextUInt64() & 0xFFFFFFFFUL);
+        }
+        while (sample >= limit);
+
+        return (int)(minValue + (sample % range));
     }
 
     /// <summary>
@@ -239,6 +254,86 @@ public class FastRng : Random
         Span<byte> buffer = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1));
         this.NextBytes(buffer);
         return value;
+    }
+
+    /// <summary>
+    /// Selects an index from an array of weights. Higher weights have a higher chance of selection.
+    /// Crucial for slot machine reel configurations and virtual wheel layouts.
+    /// </summary>
+    public int NextWeightedIndex(ReadOnlySpan<int> weights)
+    {
+        if (weights.IsEmpty) throw new ArgumentException("Weights span cannot be empty.", nameof(weights));
+
+        long totalWeight = 0;
+        for (int i = 0; i < weights.Length; i++)
+        {
+            if (weights[i] < 0) throw new ArgumentException("Weights cannot be negative.");
+            totalWeight += weights[i];
+        }
+
+        if (totalWeight == 0) throw new ArgumentException("Total sum of weights must be greater than zero.");
+
+        // Generate a random roll across the total weight spectrum
+        double roll = NextDouble() * totalWeight;
+        double runningSum = 0;
+
+        for (int i = 0; i < weights.Length; i++)
+        {
+            runningSum += weights[i];
+            if (roll < runningSum) return i;
+        }
+
+        return weights.Length - 1;
+    }
+
+    /// <summary>
+    /// Generates a perfectly uniform random integer between minValue (inclusive) and maxValue (exclusive).
+    /// Eliminates modulo and floating-point bias using mathematical rejection sampling.
+    /// </summary>
+    public int NextUniformInt(int minValue, int maxValue)
+    {
+        if (minValue >= maxValue)
+            throw new ArgumentOutOfRangeException(nameof(minValue), "MinValue must be less than maxValue.");
+
+        uint range = (uint)(maxValue - minValue);
+        if (range == 1) return minValue;
+
+        // Calculate the rejection threshold to eliminate bias
+        uint limit = uint.MaxValue - (uint.MaxValue % range);
+        uint sample;
+
+        do
+        {
+            // Re-use your ultra-fast 64-bit sequence
+            sample = (uint)(NextUInt64() & 0xFFFFFFFFUL);
+        }
+        while (sample >= limit);
+
+        return (int)(minValue + (sample % range));
+    }
+
+    /// <summary>
+    /// Shuffles an entire span in place using an unbiased Fisher-Yates algorithm.
+    /// Perfect for card games and reel sets.
+    /// </summary>
+    public void Shuffle<T>(Span<T> span)
+    {
+        if (span.Length <= 1) return;
+
+        for (int i = span.Length - 1; i > 0; i--)
+        {
+            int j = NextUniformInt(0, i + 1);
+            (span[i], span[j]) = (span[j], span[i]);
+        }
+    }
+
+    /// <summary>
+    /// Shuffles an array in place using an unbiased Fisher-Yates algorithm.
+    /// </summary>
+    public void Shuffle<T>(T[] array)
+    {
+        ArgumentNullException.ThrowIfNull(array);
+        Shuffle(array.AsSpan());
     }
 
     /// <summary>
