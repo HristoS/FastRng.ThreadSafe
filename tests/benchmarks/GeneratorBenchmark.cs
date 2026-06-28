@@ -8,7 +8,7 @@ namespace FastRng.ThreadSafe.Benchmarks;
 [HideColumns("Error", "StdDev", "Median")]
 public class GeneratorBenchmark
 {
-    private const int BufferSize = 65536; // 64KB буфер за масови тестове
+    private const int BufferSize = 65535; // 64KB буфер за масови тестове
     private byte[] _sharedBuffer = null!;
     private System.Random _systemRandom = null!;
 
