@@ -8,9 +8,11 @@ Intel Core i7-10510U CPU 1.80GHz, 1 CPU, 8 logical and 4 physical cores
 
 
 ```
-| Method                 | Mean             | Ratio        | RatioSD    | Allocated | Alloc Ratio |
-|----------------------- |-----------------:|-------------:|-----------:|----------:|------------:|
-| SystemRandom_Next      |         1.829 ns |         1.01 |       0.17 |         - |          NA |
-| FastRng_NextByte       |        48.939 ns |        27.11 |       2.94 |         - |          NA |
-| SystemRandom_NextBytes |     9,047.131 ns |     5,012.53 |     543.84 |         - |          NA |
-| FastRng_NextBytes      | 2,672,586.458 ns | 1,480,737.22 | 160,136.04 |         - |          NA |
+| Method                 | Mean          | Ratio     | RatioSD | Allocated | Alloc Ratio |
+|----------------------- |--------------:|----------:|--------:|----------:|------------:|
+| SystemRandom_Next      |      1.585 ns |      1.00 |    0.02 |         - |          NA |
+| FastRng_NextByte       |     68.756 ns |     43.40 |    1.43 |         - |          NA |
+| CryptoRandom_NextByte  |     76.163 ns |     48.07 |    1.22 |         - |          NA |
+| SystemRandom_NextBytes |  9,066.840 ns |  5,722.62 |  140.34 |         - |          NA |
+| FastRng_NextBytes      | 23,332.922 ns | 14,726.79 |  380.85 |         - |          NA |
+| CryptoRandom_NextBytes | 20,273.207 ns | 12,795.63 |  248.26 |         - |          NA |
