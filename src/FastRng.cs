@@ -22,6 +22,7 @@ public class FastRng : Random
     [ThreadStatic] private uint _generatedBytesCount;
     private const uint ReSeedInterval = 65536; // Re-seed threshold after generating 64KB
     private const uint layerCount = 16;
+    private static readonly uint[] StepTable = new uint[16] { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 4, 5, 6 };
 
     /// <summary>
     /// Initializes internal state matrices, shuffles each layer, and warms up the generator.
@@ -90,14 +91,16 @@ public class FastRng : Random
         int nextIndex = (Unsafe.Add(ref matrixRef, currentOffset + entryIndex) + Unsafe.Add(ref matrixRef, currentOffset + _j)) & 255;
         uint value = Unsafe.Add(ref matrixRef, currentOffset + nextIndex);
 
-        // Calculate dynamic cascade deepness (ranging from 3 to 6 steps)
-        uint targetLevels = (value % 4) + 3;
+        // Outputs: 4 through 16 seamlessly with no skipped integers
+        //uint raw = value & 15;
+        //uint targetLevels = (raw > 12 ? raw - 9 : raw) + 4;
+        uint targetLevels = StepTable[value & 15];
         int currentIndexForLevel = (int)value;
 
         // Propagate state modifications down through the underlying matrix layers
         for (uint step = 1; step < targetLevels; step++)
         {
-            int currentArrayIdx = (int)((step + (value % 5)) % 6);
+            int currentArrayIdx = (int)((step + value) & 15);
             int levelOffset = currentArrayIdx << 8;
 
             int localI = currentIndexForLevel;
@@ -150,12 +153,13 @@ public class FastRng : Random
             int nextIndex = (Unsafe.Add(ref matrixRef, currentOffset + entryIndex) + Unsafe.Add(ref matrixRef, currentOffset + _j)) & 255;
             uint value = Unsafe.Add(ref matrixRef, currentOffset + nextIndex);
 
-            uint targetLevels = (value % 4) + 3;
+            // Outputs: 4 through 16 seamlessly with no skipped integers
+            uint targetLevels = StepTable[value & 15];
             int currentIndexForLevel = (int)value;
 
             for (uint step = 1; step < targetLevels; step++)
             {
-                int currentArrayIdx = (int)((step + (value % 5)) % 6);
+                int currentArrayIdx = (int)((step + value) & 15);
                 int levelOffset = currentArrayIdx << 8;
 
                 int localI = currentIndexForLevel;
@@ -199,8 +203,7 @@ public class FastRng : Random
     {
         if (maxValue < 0) throw new ArgumentOutOfRangeException(nameof(maxValue), "Value must be non-negative.");
         if (maxValue == 0) return 0;
-
-        return (int)(this.NextDouble() * maxValue);
+        return this.NextUniformInt(0, maxValue);
     }
 
     /// <summary>
@@ -209,25 +212,37 @@ public class FastRng : Random
     public override int Next(int minValue, int maxValue)
     {
         if (minValue > maxValue)
+        {
             throw new ArgumentOutOfRangeException(nameof(minValue), "MinValue must be less than or equal to maxValue.");
-
+        }
         if (minValue == maxValue) return minValue;
 
+        // Use uint range to cleanly support intervals stretching across negative/positive int bounds
         uint range = (uint)(maxValue - minValue);
         if (range == 1) return minValue;
 
-        // Calculate the rejection boundary to prevent statistical clustering
-        uint limit = uint.MaxValue - (uint.MaxValue % range);
-        uint sample;
+        // Fetch an ultra-fast 32-bit random sample from your underlying 64-bit cascade
+        uint sample = (uint)(NextUInt64() & 0xFFFFFFFFUL);
 
-        do
+        // Lemire's Fast Range reduction: (sample * range) / 2^32
+        ulong product = (ulong)sample * (ulong)range;
+        uint remainder = (uint)product;
+
+        // If the remainder falls below the range, check against rejection threshold to eliminate bias
+        if (remainder < range)
         {
-            // Leverage your ultra-fast 64-bit internal cascade register
-            sample = (uint)(NextUInt64() & 0xFFFFFFFFUL);
+            // Rejection threshold loop - only executes for rare boundary values
+            uint threshold = ((uint)-(int)range) % range; // Modulo here is safe as it's compile/rare state bound
+            while (remainder < threshold)
+            {
+                sample = (uint)(NextUInt64() & 0xFFFFFFFFUL);
+                product = (ulong)sample * (ulong)range;
+                remainder = (uint)product;
+            }
         }
-        while (sample >= limit);
 
-        return (int)(minValue + (sample % range));
+        // Shift down by 32 bits to get the fast uniform result in exactly 1 CPU instruction cycle
+        return (int)(minValue + (int)(product >> 32));
     }
 
     /// <summary>
@@ -313,12 +328,21 @@ public class FastRng : Random
     /// </summary>
     public void Shuffle<T>(Span<T> span)
     {
-        if (span.Length <= 1) return;
+        int length = span.Length;
+        if (length <= 1) return;
 
-        for (int i = span.Length - 1; i > 0; i--)
+        // Count backward using basic index arithmetic for aggressive loop evaluation optimizations
+        for (int i = length - 1; i > 0; i--)
         {
-            int j = NextUniformInt(0, i + 1);
-            (span[i], span[j]) = (span[j], span[i]);
+            // Leverage the zero-modulo uniform integer mapping method directly
+            // to find a target index between 0 (inclusive) and i + 1 (exclusive)
+            int j = Next(0, i + 1);
+
+            // Swap using an explicit stack-isolated temporary reference variable.
+            // This avoids any potential heap-allocation or struct-copying traps of Tuples.
+            T temp = span[i];
+            span[i] = span[j];
+            span[j] = temp;
         }
     }
 
