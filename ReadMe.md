@@ -1,88 +1,116 @@
-﻿# FastRng.ThreadSafe 🚀
+# FastRng.ThreadSafe 🚀
 
-[![Build & Publish to NuGet]](https://github.com/HristoS/FastRng.ThreadSafe/blob/main/ReadMe.md)
-[![NuGet Version](https://shields.io)](https://www.nuget.org/packages/FastRng.ThreadSafe/)
-[![License: MIT](https://shields.io)](https://opensource.org)
+[![NuGet Version](https://img.shields.io/nuget/v/FastRng.ThreadSafe.svg)](https://www.nuget.org/packages/FastRng.ThreadSafe/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/FastRng.ThreadSafe.svg)](https://www.nuget.org/packages/FastRng.ThreadSafe/)
+[![Build](https://github.com/HristoS/FastRng.ThreadSafe/actions/workflows/build.yml/badge.svg)](https://github.com/HristoS/FastRng.ThreadSafe/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+A thread-safe, lock-free Pseudo-Random Number Generator for **.NET 10**, built on a reduced-round **AES-NI counter-mode** core. It's a drop-in replacement for `System.Random` that is measurably faster than `RandomNumberGenerator` (the framework's cryptographic RNG) on both single-value and bulk generation, while still being built on a real, published cryptographic primitive rather than an ad-hoc mixing function.
 
-An ultra-high-performance, non-blocking, thread-safe Pseudo-Random Number Generator (PRNG) engineered explicitly for modern multithreaded .NET applications (optimized for **.NET 10**), network game servers, and casino systems.
+| | `FastRng` | `RandomNumberGenerator` (Crypto RNG) | `System.Random` |
+|---|---|---|---|
+| Single value | **2.6 ns** | 74.4 ns | 2.0 ns |
+| 64 KB fill | **14.3 µs** | 19.4 µs | 8.6 µs |
+| Core primitive | AES-NI (hardware) | OS CSPRNG | xoshiro256** |
+| Thread-safe without locking | ✅ | ✅ (syscall-based) | ❌ (needs `Random.Shared`) |
+| Designed to be unpredictable | ✅ (reduced-round AES) | ✅ | ❌ (explicitly not) |
+| Casino-style helpers (weighted pick, unbiased shuffle, rejection-sampled uniform range) | ✅ | ❌ | partial (`Shuffle` only, .NET 8+) |
 
-`FastRng` inherits directly from `System.Random`, acting as a drop-in replacement that eliminates multi-threaded race conditions, lock contentions, and mathematical bias.
+*(Benchmarks: Intel i7-10510U, .NET 10.0.5, Release, BenchmarkDotNet — see [`tests/benchmarks`](tests/benchmarks) for the full report and how to reproduce it on your own hardware.)*
 
-This generator features a multi-layered, structural state permutation engine based on isolated RC4-style layers. It operates on a continuous 1.5KB flat block of memory perfectly aligned to sit inside the processor's **L1 Data Cache**. By completely omitting bounds-checking using `Unsafe` memory mapping and avoiding cross-layer state leakage, it preserves flawless 1-to-1 array permutations indefinitely.
+`FastRng` inherits directly from `System.Random`, so existing code that takes a `Random` keeps working unchanged.
 
 ---
 
-## Mathematical Foundations
+## Architecture
 
-### 1. Permutation Stability and State Space
-The internal state of the generator consists of 6 isolated layers ($M_0, M_1, \dots, M_5$), where each layer is an array containing a strict permutation of the byte space $\mathbb{Z}_{256} = \{0, 1, \dots, 255\}$. 
+The generator is a counter-mode construction in the style of Random123's **ARS** generator (Salmon et al., *"Parallel Random Numbers: As Easy as 1, 2, 3"*, SC'11) — the same family of design as NIST SP 800-90A's `CTR_DRBG using AES`, but with a deliberately reduced round count for speed:
 
-Because the algorithm relies strictly on transpositions (swaps) inside individual boundaries:
-$$\forall m \in, \quad \sum_{k=0}^{255} M_m[k] = 32640$$
+- Each 16-byte output block is `AES-Encrypt(counter XOR nonce, roundKeys)`, run for **5 AES rounds** instead of the full 10 used by standards-track AES-256. Five rounds is where published statistical batteries (and our own, see below) stop finding structure — it buys most of the diffusion quality of full AES at a fraction of the cost.
+- **8 independent counter lanes** are encrypted per 128-byte chunk. AES-NI's `AESENC` has ~4-7 cycle latency but 1-cycle throughput, so running independent lanes back-to-back keeps the pipeline full instead of stalling on each block's latency.
+- `NextByte()` pops from a small pool refilled one 128-byte chunk at a time by the exact same routine that backs `NextBytes()` — there's a single code path for both APIs, not a fast/slow pair that drifts apart.
+- Round keys and the nonce are periodically remixed with fresh OS entropy (`RandomNumberGenerator`) every 64 KB of output, so key material doesn't stay static forever.
 
-No values are cloned, and no values are deleted. The card deck is always pristine. The theoretical total state space (period bounds) of the system is defined by the permutations of all layers and index offsets:
-$$\Omega = (256!)^6 \times 256^2 \approx 10^{3044}$$
-This makes structural cycle repetition mathematically impossible over any practical software lifecycle.
+**Hardware requirement:** this design needs a CPU with **AES-NI** (and AVX2, used elsewhere in the library). That's every x86-64 CPU since roughly 2013 (Intel Haswell / AMD Excavator onward), but it will not run on ARM or on AES-NI-less hardware. There's currently no software fallback — if that matters for your deployment targets, open an issue.
 
-### 2. Cascading Diffusion and Chaotic Trajectory
-The generator utilizes a forward feedback mechanism where the byte value extracted from layer $n$ acts as an immediate pointer index for layer $n+1$. The recursion depth $L$ is a dynamic variable determined on-the-fly by the state entropy:
-$$L = (V_0 \pmod 4) + 3 \quad \implies \quad L \in [3, 6]$$
+---
 
-The transitional stepping rules for each layer $m$ satisfy:
-$$j_m = (j_{m-1} + M_m[i_m]) \pmod{256}$$
-$$\text{Swap}(M_m[i_m], M_m[j_m])$$
-$$\text{Output } V_m = M_m[(M_m[i_m] + M_m[j_m]) \pmod{256}]$$
+## Statistical & Regulatory-Style Validation
 
-By passing $V_m$ straight to the next layer as the pointer index ($i_{m+1} = V_m$), the algorithm creates an algorithmic **Avalanche Effect**. A single bit flipped at layer 0 yields completely uncorrelated trajectories across the deep matrix blocks.
+35 automated tests run on every change, split across two independent axes people often conflate:
 
-### 3. Statistical Validation
+- **Both public APIs, tested separately.** `NextByte()` and `NextBytes()` share one implementation, but they're validated independently anyway — the test suite runs the full statistical battery against `NextBytes()`'s raw output stream as well as the byte-at-a-time path, rather than assuming one implies the other.
+- **NIST SP 800-22 subset**: Frequency (Monobit), Runs, Approximate Entropy, Non-overlapping Template Matching.
+- **Distributional tests**: 256-bucket uniformity, a 256×256 pairwise-transition Chi-Squared matrix over 10,000,000 samples, dead-path coverage.
+- **FIPS 140-3 / SP 800-90A style health checks**: continuous RNG test (no stuck-output faults), sub-cycle loop detection, and a state-evolution check that the AES key material actually gets replaced across a reseed boundary.
+- **Casino-specific correctness**: unbiased Fisher-Yates shuffle (deck conservation), weighted-index convergence to exact target probabilities, zero-probability exclusion, roulette-wheel-style uniformity at a 2% regulatory-style tolerance, modulo-bias elimination, cross-thread independence under concurrent load (20 threads × 5,000 draws, Pearson correlation), and a sliding-window predictability check.
 
-#### Chi-Squared ($\chi^2$) Uniformity Analysis
-The uniform probability distribution over long-range execution paths is verified using Pearson's $\chi^2$ Goodness-of-Fit test over a grid of $65,536$ coordinate pairs:
-$$\chi^2 = \sum_{r=0}^{255} \sum_{c=0}^{255} \frac{(A_{r,c} - E)^2}{E}$$
-Where $A_{r,c}$ is the actual count of the sequential transition $r \to c$, and $E$ is the expected mathematical uniform mean ($\approx 152.58$ over 10,000,000 samples). 
+Run them yourself:
+```bash
+dotnet test tests/reliability/FastRng.ThreadSafe.tests.csproj -c Release
+```
 
-The generator consistently yields $\chi^2 \in [64000, 67000]$ for $65,535$ degrees of freedom at a $99\%$ confidence interval, perfectly matching the natural randomness curves of physical matter.
+---
 
-#### Gaussian Curve Behavior (Pairwise Cluster Bounds)
-Under a high-volume sample load, the cell counts naturally obey the Central Limit Theorem. The variation around the expected mean behaves as a classic Gaussian bell curve with a standard deviation of:
-$$\sigma = \sqrt{E} = \sqrt{152.58} \approx 12.35$$
+## Is this certified for real-money casino use?
 
-The absolute cluster ceiling for natural random path clustering hits a predictable limit of $+4.5\sigma \approx 208$ transitions per cell. This structure preserves organic randomness properties, completely passing heavy spatial tests.
+**Not yet — and be skeptical of any RNG library that claims otherwise without naming the lab.** Here's an honest breakdown of where this sits:
+
+**What's true today:** the core design (AES counter mode) is architecturally the same family NIST standardized as an approved DRBG mechanism, and it passes a real, independently-checked statistical battery — not just "looks random," but the specific pass/fail criteria NIST SP 800-22 and comparable regulatory tests define, run against both public APIs.
+
+**What real certification (GLI-19, iTech Labs, BMM Testlabs, eCOGRA, etc.) actually requires, that this project doesn't have yet:**
+- Independent accredited-lab source code review and testing — self-testing, however rigorous, isn't a substitute.
+- The full NIST SP 800-22 battery (15 tests) at regulatory sample sizes, typically supplemented with TestU01 Crush/BigCrush or DIEHARDER — this suite covers a useful subset, not the whole thing.
+- A formally justified entropy source and reseed policy against SP 800-90B, if the security-strength claim depends on it.
+- A documented decision on the reduced-round AES choice: either move to full-round AES for a "standards-literal" mode, or carry a citable cryptanalytic justification for 5 rounds being sufficient against the threat model regulators care about (not just statistical randomness — actual unpredictability under adversarial play).
+- Change-control and audit trail: regulated RNGs generally can't be silently modified post-certification.
+
+If you're evaluating this for a licensed product, treat it as a strong, fast, well-tested *building block* and budget for the accredited-lab pass — not as a finished, certified component.
+
+---
+
+## Where this sits versus other approaches
+
+| Approach | Speed | Unpredictable? | Typical use |
+|---|---|---|---|
+| xoshiro/xoroshiro, PCG | Fastest (sub-ns) | ❌ No — designed to be fast, not secure; short output windows can reveal state | Simulations, games, non-adversarial contexts |
+| `System.Random` (.NET) | Fast | ❌ No (uses xoshiro256** internally) | General-purpose app code |
+| `RandomNumberGenerator` / OS CSPRNG | Slow (syscall overhead) | ✅ Yes | Keys, tokens, anything security-critical |
+| ChaCha20-based fast CSPRNGs (e.g. `arc4random` on BSD/macOS) | Fast | ✅ Yes | OS-level userspace RNG |
+| Full AES-CTR DRBG (NIST SP 800-90A) | Moderate | ✅ Yes, formally | FIPS-validated modules, certified gaming RNGs |
+| **FastRng (this project)** | **Fast** (beats OS CSPRNG both ways) | Believed yes (reduced-round AES, not yet independently cryptanalyzed) | Game servers, simulations, RNG-heavy pipelines wanting crypto-grade design without OS-syscall cost |
+
+The gap between "fast but not secure" (xoshiro/PCG) and "secure but slow" (OS CSPRNG) is exactly the niche this fills — using a real block cipher instead of a syscall is what makes both sides of that trade-off possible at once.
 
 ---
 
 ## ✨ Features
 
-- **🛡️ 100% Thread-Safe Isolation**: Utilizes advanced thread-local processing registers to completely eliminate resource locking contention across heavily concurrent pipelines.
-- **🎰 Casino-Grade Uniformity**: Built-in uniform distribution mechanics using mathematical **rejection sampling** to completely eliminate floating-point truncation and modulo biases.
-- **🔀 Advanced Array & Span Shuffling**: Implements an unbiased Fisher-Yates shuffle engine optimized for card decks and game reels.
-- **⚖️ Weighted Index Selection**: High-speed weighted distribution support crucial for Slot Machine RTP (Return to Player) setups, loot drops, and probability engines.
-- **🔄 Deep Integration**: Fully compatible upcast mapping—if third-party frameworks cast this library to `System.Random`, our core overridden distribution hooks continue to handle the execution.
+- **🛡️ Thread-Safe Without Locking**: One instance per thread via `[ThreadStatic]`, so there's no lock contention across concurrent pipelines.
+- **🎰 Casino-Grade Uniformity**: Rejection-sampling based uniform ranges eliminate modulo and floating-point truncation bias.
+- **🔀 Unbiased Fisher-Yates Shuffle**: For card decks, reel sets, and anything needing exact permutation probabilities.
+- **⚖️ Weighted Index Selection**: For slot machine RTP tables, loot tables, and probability-weighted outcomes.
+- **🔄 Drop-in `System.Random` Replacement**: Code that accepts a `Random` works unchanged, including third-party frameworks that upcast it.
 
 ---
 
 ## 💻 Installation
 
-Install via the NuGet Package Manager Console:
-
-```bash
-Install-Package FastRng.ThreadSafe
-```
-
-Or via the .NET Core CLI:
-
 ```bash
 dotnet add package FastRng.ThreadSafe
 ```
 
+or via the NuGet Package Manager Console:
+
+```powershell
+Install-Package FastRng.ThreadSafe
+```
+
 ---
 
-## 🚀 Quick Start & Usage Examples
+## 🚀 Quick Start
 
 ### 1. Basic Generation & Drop-In Replacement
-Since `FastRng` overrides `System.Random`, you can initialize it once and share it safely across all background workers:
 
 ```csharp
 using FastRng.ThreadSafe;
@@ -91,49 +119,40 @@ using FastRng.ThreadSafe;
 Random rng = FastRng.Instance;
 
 // Generates a perfectly uniform integer: 0 to 36 inclusive (e.g., European Roulette Wheel)
-int rouletteSpin = rng.Next(0, 37); 
+int rouletteSpin = rng.Next(0, 37);
 
 double probability = rng.NextDouble();
-byte randomByte = rng.NextByte();
+byte randomByte = FastRng.Instance.NextByte();
 ```
 
 ### 2. Unbiased Card / Array Shuffling
-Perfect for card games (Blackjack, Poker) or generating random paths without duplicate items.
 
 ```csharp
 var rng = FastRng.Instance;
 
-// Generate a classic card deck
 int[] playingCards = Enumerable.Range(0, 52).ToArray();
-
-// Shuffles the data in-place with exactly uniform permutation probabilities
-rng.Shuffle(playingCards);
+rng.Shuffle(playingCards); // exactly uniform permutation probabilities
 ```
 
-### 3. Casino Weighted Selection (Slot Machine Reel Strip)
-Ideal for game mechanics where different symbols or rewards have varying likelihoods of appearing.
+### 3. Weighted Selection (Slot Machine Reel Strip)
 
 ```csharp
 var rng = FastRng.Instance;
 
-// Index 0 (Jackpot) = 1% chance
-// Index 1 (Medium Reward) = 19% chance
-// Index 2 (Common Loss) = 80% chance
+// Index 0 (Jackpot) = 1% chance, Index 1 = 19%, Index 2 = 80%
 int[] prizeWeights = { 10, 190, 800 };
-
-// Automatically calculates total ranges and returns the winning index selection safely
 int winningPrizeIndex = rng.NextWeightedIndex(prizeWeights);
 ```
 
 ---
 
-## 🔬 Statistical Security & Fairness Validation
+## ☕ Support This Project
 
-Every release of `FastRng` is rigorously audited by our automated testing pipeline against industry-standard mathematical and entropic evaluations:
+`FastRng` is free, MIT-licensed, and maintained in my spare time. If it saved you the trouble of rolling your own thread-safe RNG (or just made your benchmarks look better), consider buying me a coffee — it directly funds the time spent on things like the AES-NI redesign and the statistical validation suite above:
 
-- **📊 Multidimensional Independence**: Validated using a **2D Chi-Squared Matrix Transition Grid** ($256 \times 256$ state paths over 10,000,000 continuous draws) to prove consecutive draws have zero serial memory correlation.
-- **🛡️ NIST SP 800-22 Frequency (Monobit)**: **PASSED** (Ensures a true 50/50 balance of density distribution between binary bitstreams).
-- **🛡️ NIST SP 800-22 Runs Test**: **PASSED** (Confirms bit transformations oscillate at a natural, non-repeating structural tempo).
+**[ko-fi.com/hristostoev](https://ko-fi.com/hristostoev)**
+
+Issues, PRs, and star-throwing are just as welcome.
 
 ---
 

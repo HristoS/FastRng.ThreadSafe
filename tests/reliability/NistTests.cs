@@ -216,7 +216,7 @@ namespace FastRng.ThreadSafe.Tests
         /// Approximates the Complementary Error Function (erfc) using the highly accurate
         /// Chebyshev fitting formula (maximum error scale limit of less than 1.2 x 10^-7).
         /// </summary>
-        private static double Erfc(double x)
+        internal static double Erfc(double x)
         {
             double z = Math.Abs(x);
             double t = 1.0 / (1.0 + 0.5 * z);
@@ -238,7 +238,7 @@ namespace FastRng.ThreadSafe.Tests
             return x >= 0.0 ? ans : 2.0 - ans;
         }
 
-        private static double ComputePhi(byte[] bits, int m, int n)
+        internal static double ComputePhi(byte[] bits, int m, int n)
         {
             int totalPatterns = 1 << m;
             int[] counts = new int[totalPatterns];

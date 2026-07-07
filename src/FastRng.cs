@@ -1,14 +1,16 @@
-﻿using System.Runtime.CompilerServices;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Security.Cryptography;
+using Aes = System.Runtime.Intrinsics.X86.Aes;
 
 namespace FastRng.ThreadSafe;
 
 /// <summary>
-/// A thread-safe pseudo-random number generator utilizing a multi-layer cascade matrix.
-/// Derived from <see cref="Random"/> to seamlessly replace standard generation methods.
+/// A thread-safe pseudo-random number generator built on a reduced-round AES-NI counter-mode
+/// construction (in the style of Random123's ARS generator). Derived from <see cref="Random"/>
+/// to seamlessly replace standard generation methods.
 /// </summary>
 public class FastRng : Random
 {
@@ -17,97 +19,62 @@ public class FastRng : Random
 
     public static FastRng Instance => _localInstance ??= new FastRng();
 
-    // Flattened 1D array representing 6 layers of 256-byte substitution matrices
-    [ThreadStatic] private byte[] _flatMatrix;
+    // Reduced-round AES (ARS-style): each 16-byte block gets 1 whitening XOR + this many AES
+    // rounds. Full AES uses 10 rounds for adversarial security; 5 is what Random123's ARS-5
+    // generator uses and is well past the point where SP800-22-style statistical batteries
+    // stop finding structure, while being noticeably cheaper per block than full AES.
+    private const int Rounds = 5;
 
-    [ThreadStatic] private int _i;
-    [ThreadStatic] private int _j;
+    // Independent counter lanes generated per chunk. AESENC has ~4-7 cycle latency but 1/cycle
+    // throughput; running several independent lanes back-to-back keeps the pipeline full instead
+    // of stalling on each block's latency.
+    private const int LaneCount = 8;
+    private const int ChunkSize = LaneCount * 16; // 128 bytes per chunk
 
-    [ThreadStatic] private uint _generatedBytesCount;
+    private readonly Vector128<byte>[] _roundKeys = new Vector128<byte>[Rounds + 1];
+    private Vector128<byte> _nonce;
+    private ulong _counter;
+
+    private uint _generatedBytesCount;
     private const uint ReSeedInterval = 65536; // Re-seed threshold after generating 64KB
-    private const uint layerCount = 16;
-    private static readonly uint[] StepTable = new uint[16] { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 4, 5, 6 };
+
+    // Single-byte requests are served from a pool refilled one AES chunk at a time, instead of
+    // running the AES pipeline down to a single 16-byte block per call.
+    private const int PoolSize = ChunkSize;
+    private readonly byte[] _pool = new byte[PoolSize];
+    private int _poolPos = PoolSize;
 
     /// <summary>
-    /// Initializes internal state matrices, shuffles each layer, and warms up the generator.
+    /// Seeds the AES round keys, nonce and counter from OS-provided cryptographic entropy.
     /// </summary>
     private FastRng()
     {
-        _flatMatrix = new byte[layerCount * 256];
+        Span<byte> seed = stackalloc byte[(Rounds + 1) * 16 + 16];
+        RandomNumberGenerator.Fill(seed);
 
-        // Fill layers with sequential values from 0 to 255
-        for (int m = 0; m < layerCount; m++)
+        for (int k = 0; k <= Rounds; k++)
         {
-            int offset = m << 8;
-            for (int k = 0; k < 256; k++) _flatMatrix[offset + k] = (byte)k;
+            _roundKeys[k] = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(seed.Slice(k * 16, 16)));
         }
 
-        // Randomize the initial state pointers using cryptographic entropy
-        _i = RandomNumberGenerator.GetInt32(256);
-        _j = RandomNumberGenerator.GetInt32(256);
+        _nonce = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(seed.Slice((Rounds + 1) * 16, 16)));
+        _counter = 0;
     }
 
     /// <summary>
-    /// Provides the singleton instance isolated to the current execution thread.
+    /// Generates a single pseudo-random byte, popped from a pool refilled one AES chunk at a
+    /// time by the same generator that backs <see cref="NextBytes(Span{byte})"/>.
     /// </summary>
-
-    /// <summary>
-    /// Generates a single pseudo-random byte using multi-layered cascade mutations.
-    /// </summary>
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public byte NextByte()
     {
-        _generatedBytesCount++;
-        if (_generatedBytesCount >= ReSeedInterval)
+        if (_poolPos >= PoolSize)
         {
-            InjectHardwareEntropy();
+            GenerateChunk(_pool);
+            _poolPos = 0;
         }
 
-        _i = (_i + 1) & 255;
-        ref byte matrixRef = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(_flatMatrix);
-
-        int dynamicStep = Unsafe.Add(ref matrixRef, _i);
-        _j = (_j + dynamicStep) & 255;
-        int entryIndex = (_i + dynamicStep) & 255;
-
-        ref byte baseEntryRef = ref Unsafe.Add(ref matrixRef, entryIndex);
-        ref byte baseJRef = ref Unsafe.Add(ref matrixRef, _j);
-        byte tempBase = baseEntryRef;
-        baseEntryRef = baseJRef;
-        baseJRef = tempBase;
-
-        int nextIndex = (baseEntryRef + baseJRef) & 255;
-        uint value = Unsafe.Add(ref matrixRef, nextIndex);
-
-        uint targetLevels = (value & 15) + 4;
-        int currentIndexForLevel = (int)value;
-        int currentLayerIdx = (int)(value & 15);
-
-        for (uint step = 1; step < targetLevels; step++)
-        {
-            currentLayerIdx = (currentLayerIdx + 1) & 15;
-            ref byte layerRef = ref Unsafe.Add(ref matrixRef, currentLayerIdx << 8);
-
-            int localI = currentIndexForLevel;
-            int localJ = (localI + _i + dynamicStep) & 255;
-
-            ref byte layerIRef = ref Unsafe.Add(ref layerRef, localI);
-            ref byte layerJRef = ref Unsafe.Add(ref layerRef, localJ);
-            byte tempLayer = layerIRef;
-            layerIRef = layerJRef;
-            layerJRef = tempLayer;
-
-            int finalIndex = (layerIRef + layerJRef) & 255;
-            value = Unsafe.Add(ref layerRef, finalIndex);
-            currentIndexForLevel = (int)value;
-        }
-
-        // Direct feedback mutation back into Layer 0 to break pair-grid clustering
-        int feedbackIdx = (_i + (int)value) & 255;
-        Unsafe.Add(ref matrixRef, feedbackIdx) ^= (byte)(value ^ dynamicStep);
-
-        return (byte)value;
+        return _pool[_poolPos++];
     }
 
     /// <summary>
@@ -118,77 +85,51 @@ public class FastRng : Random
     {
         if (buffer.Length == 0) return;
 
-        ref byte matrixRef = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(_flatMatrix);
         int i = 0;
         int totalLength = buffer.Length;
 
-        // --- STRIDE 1: High-Throughput 4x Vector Unrolling ---
-        for (; i <= totalLength - 128; i += 128)
+        for (; i <= totalLength - ChunkSize; i += ChunkSize)
         {
-            _generatedBytesCount += 128;
-            if (_generatedBytesCount >= ReSeedInterval)
-            {
-                InjectHardwareEntropy();
-                matrixRef = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(_flatMatrix);
-                _generatedBytesCount = 128;
-            }
-
-            _i = (_i + 1) & 255;
-            int dynamicStep = Unsafe.Add(ref matrixRef, _i);
-            _j = (_j + dynamicStep) & 255;
-
-            // FIX 1: Completely eliminate fixed offsets (+8, +16, +24).
-            // Track starting points are now completely dynamic and chaotic based on internal state!
-            int startTrack1 = _i;
-            int startTrack2 = (_i + _j) & 255;
-            int startTrack3 = (_i + dynamicStep) & 255;
-            int startTrack4 = (_j + dynamicStep) & 255;
-
-            Vector256<byte> balls1 = Vector256.LoadUnsafe(ref Unsafe.Add(ref matrixRef, startTrack1));
-            Vector256<byte> balls2 = Vector256.LoadUnsafe(ref Unsafe.Add(ref matrixRef, startTrack2));
-            Vector256<byte> balls3 = Vector256.LoadUnsafe(ref Unsafe.Add(ref matrixRef, startTrack3));
-            Vector256<byte> balls4 = Vector256.LoadUnsafe(ref Unsafe.Add(ref matrixRef, startTrack4));
-
-            for (int layer = 1; layer < 16; layer++)
-            {
-                int layerOffset = layer << 8;
-                Vector256<byte> sticks = Vector256.LoadUnsafe(ref Unsafe.Add(ref matrixRef, layerOffset));
-                Vector256<byte> rotation = Vector256.Create((byte)(dynamicStep + layer));
-
-                balls1 = Avx2.Xor(balls1, sticks); balls1 = Avx2.Add(balls1, rotation);
-                balls2 = Avx2.Xor(balls2, sticks); balls2 = Avx2.Add(balls2, rotation);
-                balls3 = Avx2.Xor(balls3, sticks); balls3 = Avx2.Add(balls3, rotation);
-                balls4 = Avx2.Xor(balls4, sticks); balls4 = Avx2.Add(balls4, rotation);
-
-                // Mutate layers 1-15 permanently to pass NIST Backtracking
-                Vector256<byte> layerMutation = Avx2.Xor(balls1, balls3);
-                layerMutation.CopyTo(_flatMatrix.AsSpan(layerOffset, 32));
-            }
-
-            // FIX 2: Non-linear diffusion mixer to destroy all linear algebraic dependencies
-            Vector256<byte> mix1 = Avx2.Xor(balls1, balls4);
-            Vector256<byte> mix2 = Avx2.Xor(balls2, balls3);
-
-            balls1 = Avx2.Add(balls1, mix2);
-            balls2 = Avx2.Add(balls2, mix1);
-            balls3 = Avx2.Xor(balls3, balls1);
-            balls4 = Avx2.Xor(balls4, balls2);
-
-            // Mutate Base Layer 0 to break all consecutive serial correlation (Passes Chi-Squared)
-            Vector256<byte> baseMutation = Avx2.Xor(balls2, balls4);
-            baseMutation.CopyTo(_flatMatrix.AsSpan(startTrack1, 32));
-
-            balls1.CopyTo(buffer.Slice(i + 0, 32));
-            balls2.CopyTo(buffer.Slice(i + 32, 32));
-            balls3.CopyTo(buffer.Slice(i + 64, 32));
-            balls4.CopyTo(buffer.Slice(i + 96, 32));
+            GenerateChunk(buffer.Slice(i, ChunkSize));
         }
 
-        // --- STRIDE 2: Mop up trailing bytes individually using our optimized scalar path ---
         for (; i < totalLength; i++)
         {
             buffer[i] = NextByte();
         }
+    }
+
+    /// <summary>
+    /// Produces exactly <see cref="ChunkSize"/> bytes by running <see cref="LaneCount"/>
+    /// independent AES-CTR blocks. Shared by both <see cref="NextBytes(Span{byte})"/> and the
+    /// <see cref="NextByte"/> pool refill.
+    /// </summary>
+    private void GenerateChunk(Span<byte> dest)
+    {
+        _generatedBytesCount += ChunkSize;
+        if (_generatedBytesCount >= ReSeedInterval)
+        {
+            InjectHardwareEntropy();
+        }
+
+        ulong baseCounter = _counter;
+
+        for (int lane = 0; lane < LaneCount; lane++)
+        {
+            Vector128<byte> counterBlock = Vector128.Create(baseCounter + (ulong)lane, 0UL).AsByte();
+            Vector128<byte> block = Sse2.Xor(counterBlock, _nonce);
+
+            block = Sse2.Xor(block, _roundKeys[0]);
+            for (int r = 1; r < Rounds; r++)
+            {
+                block = Aes.Encrypt(block, _roundKeys[r]);
+            }
+            block = Aes.EncryptLast(block, _roundKeys[Rounds]);
+
+            block.CopyTo(dest.Slice(lane * 16, 16));
+        }
+
+        _counter = baseCounter + LaneCount;
     }
 
     /// <summary>
@@ -369,34 +310,25 @@ public class FastRng : Random
     }
 
     /// <summary>
-    /// Inject fresh hardware entropy harvested from the OS layer into internal matrix states.
-    /// Defends state alignment against prediction and state reconstruction analysis.
+    /// Injects fresh hardware entropy harvested from the OS layer into the AES round keys and
+    /// nonce. Defends against long-run state reconstruction: even if an observer inferred the
+    /// current key material from output, it stops applying after the next injection.
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void InjectHardwareEntropy()
     {
         _generatedBytesCount = 0;
 
-        // Retrieve strong cryptographic chaos directly from the operating system
-        Span<byte> hardwareChaos = stackalloc byte[16];
+        Span<byte> hardwareChaos = stackalloc byte[(Rounds + 1) * 16 + 16];
         RandomNumberGenerator.Fill(hardwareChaos);
 
-        Span<byte> matrixSpan = _flatMatrix;
-        ref byte matrixRef = ref MemoryMarshal.GetReference(matrixSpan);
-
-        // Mix hardware entropy across all matrix layers via strategic target cell swapping
-        for (int m = 0; m < layerCount; m++)
+        for (int k = 0; k <= Rounds; k++)
         {
-            int levelOffset = m << 8;
-            int targetCellA = hardwareChaos[m] & 255;
-            int targetCellB = hardwareChaos[(m + 1) % 8] & 255;
-
-            (Unsafe.Add(ref matrixRef, levelOffset + targetCellA), Unsafe.Add(ref matrixRef, levelOffset + targetCellB)) =
-            (Unsafe.Add(ref matrixRef, levelOffset + targetCellB), Unsafe.Add(ref matrixRef, levelOffset + targetCellA));
+            Vector128<byte> freshKey = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(hardwareChaos.Slice(k * 16, 16)));
+            _roundKeys[k] = Sse2.Xor(_roundKeys[k], freshKey);
         }
 
-        // Apply dedicated chaos indexes [6] and [7] to securely perturb pointer positions
-        _i = (_i ^ hardwareChaos[6]) & 255;
-        _j = (_j ^ hardwareChaos[7]) & 255;
+        Vector128<byte> freshNonce = Vector128.LoadUnsafe(ref MemoryMarshal.GetReference(hardwareChaos.Slice((Rounds + 1) * 16, 16)));
+        _nonce = Sse2.Xor(_nonce, freshNonce);
     }
 }

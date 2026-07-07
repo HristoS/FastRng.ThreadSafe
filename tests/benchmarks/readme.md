@@ -3,8 +3,9 @@
 This directory contains the microbenchmark suite for `FastRng`, utilizing [BenchmarkDotNet](https://github.com) to measure nano-second execution latency, memory allocation behaviors, and generation throughput compared directly against the standard .NET runtime generators.
 
 ## Benchmarked Engines
-* **`FastRng`**: The refactored thread-isolated, zero-allocation, Fast-Key-Erasure generator using a flat memory layout and `.NET 10` native hardware intrinsics.
-* **`System.Random`**: The default pseudo-random number generator provided by the .NET core framework runtime.
+* **`FastRng`**: The thread-isolated, zero-allocation, reduced-round AES-NI counter-mode generator, using `.NET 10` native hardware intrinsics (`System.Runtime.Intrinsics.X86.Aes`/`Avx2`).
+* **`System.Random`**: The default pseudo-random number generator provided by the .NET core framework runtime (xoshiro256**-based, not cryptographically secure).
+* **`RandomNumberGenerator`**: The framework's cryptographically secure RNG, backed by the OS CSPRNG. This is the baseline `FastRng` is designed to outperform while still using a real block cipher internally.
 
 ---
 

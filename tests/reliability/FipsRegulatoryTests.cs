@@ -1,9 +1,17 @@
-﻿using Xunit;
+﻿using System.Runtime.Intrinsics;
+using Xunit;
 
 namespace FastRng.ThreadSafe.Tests;
 
 public class FipsRegulatoryTests
 {
+    private static byte[] ToBytes(Vector128<byte> vector)
+    {
+        byte[] bytes = new byte[16];
+        for (int i = 0; i < 16; i++) bytes[i] = vector.GetElement(i);
+        return bytes;
+    }
+
     /// <summary>
     /// FIPS 140-3 Section 4.9.1: Continuous RNG Test (CRNGT).
     /// Mandates that every generated block must be compared to the previous block.
@@ -44,66 +52,41 @@ public class FipsRegulatoryTests
 
     /// <summary>
     /// NIST SP 800-90A Section 11.3: Health Testing / State Back-Tracking Detection.
-    /// Updated to allow the dynamic 16-layer engine to naturally mutate across cycles.
+    /// The AES-CTR core keeps its round keys fixed between reseed cycles by design (that's what
+    /// makes it a counter-mode construction); the property this test actually needs is that the
+    /// secret key material gets replaced once a reseed boundary (ReSeedInterval bytes) is crossed.
     /// </summary>
     [Fact]
     public void NistSP80090A_StateBacktrackingResistanceTest()
     {
         var generator = FastRng.Instance;
+        var roundKeysField = typeof(FastRng).GetField("_roundKeys",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var nonceField = typeof(FastRng).GetField("_nonce",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
-        // 1. Initial generation to settle state
-        byte[] bufferA = new byte[1024];
-        generator.NextBytes(bufferA);
+        Assert.NotNull(roundKeysField);
+        Assert.NotNull(nonceField);
 
-        // FIX: Retrieve the private, ThreadStatic array field via FieldInfo reflection
-        var flatMatrixField = typeof(FastRng).GetField("_flatMatrix",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static);
+        var keysBefore = ((Vector128<byte>[])roundKeysField.GetValue(generator)!).Select(ToBytes).ToArray();
+        var nonceBefore = ToBytes((Vector128<byte>)nonceField.GetValue(generator)!);
 
-        Assert.NotNull(flatMatrixField);
+        // Cross at least one ReSeedInterval (65536 bytes) boundary so InjectHardwareEntropy fires
+        generator.NextBytes(new byte[100_000]);
 
-        // For [ThreadStatic] fields, passing 'null' or the instance extracts the thread-local value
-        byte[] state = flatMatrixField.GetValue(generator) as byte[];
+        var keysAfter = ((Vector128<byte>[])roundKeysField.GetValue(generator)!).Select(ToBytes).ToArray();
+        var nonceAfter = ToBytes((Vector128<byte>)nonceField.GetValue(generator)!);
 
-        Assert.NotNull(state);
-        byte[] stateSnapshotBefore = (byte[])state.Clone();
+        int stagnantLayers = keysBefore.Where((k, idx) => k.SequenceEqual(keysAfter[idx])).Count();
+        if (nonceBefore.SequenceEqual(nonceAfter)) stagnantLayers++;
 
-        // 2. Generate a substantial block stream to allow all dynamic level boundaries to cycle
-        byte[] bufferB = new byte[16384];
-        generator.NextBytes(bufferB);
-
-        byte[] stateSnapshotAfter = (byte[])state.Clone();
-
-        // 3. NIST Layer-by-Layer Evolution Audit
-        int stagnantLayers = 0;
-        const int totalLayers = 16;
-
-        for (int layer = 0; layer < totalLayers; layer++)
-        {
-            // FIX: Remove MetadataSize. Your _flatMatrix array starts directly at index 0.
-            int offset = layer << 8;
-            bool layerIsIdentical = true;
-
-            for (int i = 0; i < 256; i++)
-            {
-                if (stateSnapshotBefore[offset + i] != stateSnapshotAfter[offset + i])
-                {
-                    layerIsIdentical = false;
-                    break; // Layer successfully evolved!
-                }
-            }
-
-            if (layerIsIdentical)
-            {
-                stagnantLayers++;
-            }
-        }
-
+        int totalLayers = keysBefore.Length + 1;
         double layerStagnationRatio = (double)stagnantLayers / totalLayers;
 
-        // Under NIST SP 800-90A, all layers must participate in state tracking.
+        // Under NIST SP 800-90A, all key material must participate in state tracking.
         Assert.True(layerStagnationRatio == 0.0,
             $"NIST SP 800-90A Backtracking Fault! {stagnantLayers} out of {totalLayers} " +
-            $"memory layers are completely frozen and failed to evolve. Ratio: {layerStagnationRatio:P2}");
+            $"key elements are completely frozen and failed to evolve. Ratio: {layerStagnationRatio:P2}");
     }
 
     /// <summary>
