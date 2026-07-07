@@ -6,7 +6,7 @@
 
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>FastRng.ThreadSafe</PackageId>
-    <Version>1.0.6</Version>
+    <Version>1.0.7</Version>
     <Authors>HristoS</Authors>
     <Description>A thread-safe, lock-free .NET 10 PRNG built on a reduced-round AES-NI counter-mode core. Faster than RandomNumberGenerator (the OS cryptographic RNG) on both single values and bulk fills, with built-in casino-style uniform ranges, weighted selection, and unbiased shuffle. If you find it useful, consider supporting development: https://ko-fi.com/hristostoev</Description>
     <PackageTags>random;rng;threadsafe;high-performance;cryptography;aes-ni;ctr-drbg;casino;gaming;simulation</PackageTags>
