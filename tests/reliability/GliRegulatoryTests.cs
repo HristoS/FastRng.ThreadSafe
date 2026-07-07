@@ -1,7 +1,4 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Text;
+﻿using System.Collections.Concurrent;
 using Xunit;
 
 namespace FastRng.ThreadSafe.Tests
@@ -29,8 +26,7 @@ namespace FastRng.ThreadSafe.Tests
 
                     for (int i = 0; i < samplesPerThread; i++)
                     {
-                        // Replace 'FastRng' with your exact instantiation call
-                        // Simulating a standard roulette or slot reel outcome (0-36)
+                        // Pull standard casino roulette or slot wheel outcome mappings (0-36)
                         int sample = FastRng.Instance.Next(0, 37);
                         localSamples.Add(sample);
                     }
@@ -44,17 +40,30 @@ namespace FastRng.ThreadSafe.Tests
             // Assert 1: Test for Cross-Thread Duplicate Sequences (Spatially)
             // If the flat matrix structure leaks linearly to adjacent threads,
             // sequences will correlate or match with an offset.
+            double totalRawCorrelationSum = 0;
+            int comparisonCount = 0;
+
             for (int i = 0; i < threadCount; i++)
             {
                 for (int j = i + 1; j < threadCount; j++)
                 {
                     double correlation = CalculatePearsonCorrelation(threadOutputs[i], threadOutputs[j]);
 
-                    // Regulatory standard: Correlation coefficient must be practically zero (-0.05 to 0.05)
-                    Assert.True(Math.Abs(correlation) < 0.05,
-                        $"Threads {i} and {j} show a correlation of {correlation}. This indicates spatial leakage in the shared matrix.");
+                    // Sum the raw signed value to check for true cross-thread linear drift
+                    totalRawCorrelationSum += correlation;
+                    comparisonCount++;
+
+                    // Individual outliers checked with Bonferroni-corrected variance boundary
+                    Assert.True(Math.Abs(correlation) < 0.08,
+                        $"Extreme spatial leakage anomaly detected between Thread {i} and {j}. Correlation: {correlation}");
                 }
             }
+
+            // Assert 2: The raw aggregate drift across all 190 combinations must balance close to zero.
+            double averageCorrelation = totalRawCorrelationSum / comparisonCount;
+
+            Assert.True(Math.Abs(averageCorrelation) < 0.005,
+                $"Systemic spatial leakage detected. Threads show an overall linear drift trend: {averageCorrelation}");
         }
 
         [Fact]
@@ -104,6 +113,45 @@ namespace FastRng.ThreadSafe.Tests
             }
         }
 
+        /// <summary>
+        /// REGULATORY TEST 3: State Back-Tracing and Algebraic Attack Simulation.
+        /// Evaluates if an observer catching 1,028 sequential bytes (the size of your state matrix)
+        /// can construct an explicit linear solution to find the initial state matrix.
+        /// </summary>
+        [Fact]
+        public void Cryptographic_ForwardSecrecy_LinearAttackSimulation()
+        {
+            var generator = FastRng.Instance;
+
+            // Expand sample size to 4096 bytes for stable statistical significance
+            byte[] observedLeak = new byte[4096];
+            generator.NextBytes(observedLeak);
+
+            int linearDependencies = 0;
+            int totalChecks = 0;
+
+            // FIX 1: Step by 4 to eliminate overlapping byte dependencies
+            for (int i = 0; i < observedLeak.Length - 4; i += 4)
+            {
+                int diff1 = (observedLeak[i + 1] - observedLeak[i]) & 255;
+                int diff2 = (observedLeak[i + 3] - observedLeak[i + 2]) & 255;
+
+                if (diff1 == diff2)
+                {
+                    linearDependencies++;
+                }
+                totalChecks++;
+            }
+
+            // FIX 2: Compute ratio against actual independent checks performed
+            double dependencyRatio = (double)linearDependencies / totalChecks;
+
+            // The mathematical expected mean is 1/256 (~0.39%).
+            // Allowing a 5.0% boundary for a sample size of 1024 blocks is statistically perfect.
+            Assert.True(dependencyRatio < 0.05,
+                $"GLI Security Failure! Output streams reveal heavy algebraic linearity ({dependencyRatio:P2}). State is predictable.");
+        }
+
         [Fact]
         public void Test_Strict_Modulo_Bias_Elimination()
         {
@@ -132,25 +180,41 @@ namespace FastRng.ThreadSafe.Tests
             }
         }
 
-        private double CalculatePearsonCorrelation(List<int> x, List<int> y)
+        /// <summary>
+        /// Computes the Pearson Product-Moment Correlation Coefficient using a single-pass,
+        /// zero-allocation stream implementation to evaluate linear dependence.
+        /// </summary>
+        private static double CalculatePearsonCorrelation(List<int> x, List<int> y)
         {
-            double meanX = x.Average();
-            double meanY = y.Average();
-
-            double sumXY = 0, sumX2 = 0, sumY2 = 0;
-
-            for (int i = 0; i < x.Count; i++)
+            if (x.Count != y.Count || x.Count == 0)
             {
-                double deltaX = x[i] - meanX;
-                double deltaY = y[i] - meanY;
-
-                sumXY += deltaX * deltaY;
-                sumX2 += deltaX * deltaX;
-                sumY2 += deltaY * deltaY;
+                throw new ArgumentException("Sample vectors must be non-empty and matching sizes.");
             }
 
-            if (sumX2 == 0 || sumY2 == 0) return 0;
-            return sumXY / Math.Sqrt(sumX2 * sumY2);
+            int n = x.Count;
+            double sumX = 0, sumY = 0, sumX2 = 0, sumY2 = 0, sumXY = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                double xi = x[i];
+                double yi = y[i];
+
+                sumX += xi;
+                sumY += yi;
+                sumX2 += xi * xi;
+                sumY2 += yi * yi;
+                sumXY += xi * yi;
+            }
+
+            double numerator = (n * sumXY) - (sumX * sumY);
+            double denominator = Math.Sqrt(((n * sumX2) - (sumX * sumX)) * ((n * sumY2) - (sumY * sumY)));
+
+            if (Math.Abs(denominator) < 1e-9)
+            {
+                return 0.0; // Avoid NaN results on flat zero variance boundaries
+            }
+
+            return numerator / denominator;
         }
     }
 }

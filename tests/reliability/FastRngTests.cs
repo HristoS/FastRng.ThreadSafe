@@ -451,4 +451,56 @@ public class FastRngTests
         Assert.InRange(idx1Ratio, 0.795, 0.805); // Must hover precisely near 80%
         Assert.InRange(idx2Ratio, 0.095, 0.105); // Must hover precisely near 10%
     }
+
+    [Fact]
+    public async Task VerifyStateIsolationUnderHeavyAsyncLoad()
+    {
+        int concurrentTasksCount = 200;
+        int operationsPerTask = 500;
+
+        var resultsCollection = new ConcurrentDictionary<int, byte[]>();
+        var tasks = new List<Task>();
+
+        for (int i = 0; i < concurrentTasksCount; i++)
+        {
+            int taskId = i;
+            tasks.Add(Task.Run(async () =>
+            {
+                byte[] generatedBuffer = new byte[operationsPerTask];
+
+                for (int op = 0; op < operationsPerTask; op++)
+                {
+                    // Randomly yield control back to the ThreadPool to force context switching
+                    if (op % 10 == 0)
+                    {
+                        await Task.Yield();
+                    }
+
+                    generatedBuffer[op] = FastRng.Instance.NextByte();
+                }
+
+                resultsCollection[taskId] = generatedBuffer;
+            }));
+        }
+
+        // Wait for all concurrent async paths to complete execution
+        await Task.WhenAll(tasks);
+
+        // Verification 1: Ensure all tasks executed and filled their buffers completely
+        Assert.Equal(concurrentTasksCount, resultsCollection.Count);
+
+        // Verification 2: Ensure uniqueness across concurrent streams.
+        // If state shared or bled across tasks due to context-switching bugs,
+        // we would see duplicate array patterns across different thread tasks.
+        var uniqueSubsets = new HashSet<string>();
+        foreach (var buffer in resultsCollection.Values)
+        {
+            // Take a sample slice from each buffer to check for cross-task mirroring
+            string sampleString = Convert.ToBase64String(buffer.AsSpan(0, 16));
+            uniqueSubsets.Add(sampleString);
+        }
+
+        // If tasks shared state, their sequences would match, causing duplicate samples
+        Assert.Equal(concurrentTasksCount, uniqueSubsets.Count);
+    }
 }
