@@ -8,9 +8,30 @@ namespace FastRng.ThreadSafe.Tests;
 /// repeated <see cref="FastRng.NextByte"/> calls. The rest of the suite only ever exercises
 /// NextByte's algorithm; regulators evaluating the advertised bulk-throughput API would see
 /// this stream instead, so it needs its own direct baseline.
+///
+/// The NIST-style tests below are judged by pass proportion across many independent trials
+/// (matching NIST SP 800-22 Section 4.2.1) rather than a single draw, since a single-shot check
+/// at alpha=0.01 fails ~1% of genuinely random sequences by definition.
 /// </summary>
 public class NextBytesStreamTests
 {
+    private const double SignificanceLevel = 0.01;
+    private const int TotalTrials = 100;
+    private const int MinimumPassingProportion = 96; // NIST SP 800-22 minimum for 100 trials at alpha=0.01
+
+    private static void AssertProportionPasses(Func<bool> trial, string failureLabel)
+    {
+        int passCount = 0;
+        for (int t = 0; t < TotalTrials; t++)
+        {
+            if (trial()) passCount++;
+        }
+
+        Assert.True(passCount >= MinimumPassingProportion,
+            $"{failureLabel} Proportion of passing sequences is too low. " +
+            $"Got {passCount}/{TotalTrials} passing runs. (NIST minimum required: {MinimumPassingProportion})");
+    }
+
     [Fact]
     public void NextBytes_UniformDistributionTest()
     {
@@ -113,71 +134,72 @@ public class NextBytesStreamTests
     public void Nist_NextBytes_FrequencyMonobitTest_ShouldPass()
     {
         var generator = FastRng.Instance;
-        const int totalBits = 200_000;
-        byte[] samples = new byte[totalBits];
-        generator.NextBytes(samples);
 
-        int sum = 0;
-        foreach (byte sample in samples)
+        AssertProportionPasses(() =>
         {
-            int bit = sample % 2;
-            sum += (2 * bit) - 1;
-        }
+            const int totalBits = 200_000;
+            byte[] samples = new byte[totalBits];
+            generator.NextBytes(samples);
 
-        double sObs = Math.Abs(sum) / Math.Sqrt(totalBits);
-        double pValue = NistTests.Erfc(sObs / Math.Sqrt(2.0));
+            int sum = 0;
+            foreach (byte sample in samples)
+            {
+                int bit = sample % 2;
+                sum += (2 * bit) - 1;
+            }
 
-        Assert.True(pValue >= 0.01,
-            $"NIST Monobit Failure! Bitstream is structurally biased. P-Value: {pValue:F6} (Expected >= 0.01). Bias Sum: {sum}");
+            double sObs = Math.Abs(sum) / Math.Sqrt(totalBits);
+            double pValue = NistTests.Erfc(sObs / Math.Sqrt(2.0));
+            return pValue >= SignificanceLevel;
+        }, "NIST Monobit Failure! Bitstream is structurally biased.");
     }
 
     [Fact]
     public void Nist_NextBytes_RunsTest_ShouldPass()
     {
         var generator = FastRng.Instance;
-        const int totalBits = 200_000;
-        byte[] samples = new byte[totalBits];
-        generator.NextBytes(samples);
 
-        int[] bitSequence = new int[totalBits];
-        double onesProportion = 0;
-        for (int i = 0; i < totalBits; i++)
+        AssertProportionPasses(() =>
         {
-            bitSequence[i] = samples[i] % 2;
-            if (bitSequence[i] == 1) onesProportion++;
-        }
-        onesProportion /= totalBits;
+            const int totalBits = 200_000;
+            byte[] samples = new byte[totalBits];
+            generator.NextBytes(samples);
 
-        if (Math.Abs(onesProportion - 0.5) >= (2.0 / Math.Sqrt(totalBits)))
-        {
-            Assert.Fail($"NIST Runs Pre-test skipped/failed: Frequency proportion ({onesProportion:F4}) is too far from 0.5.");
-        }
+            int[] bitSequence = new int[totalBits];
+            double onesProportion = 0;
+            for (int i = 0; i < totalBits; i++)
+            {
+                bitSequence[i] = samples[i] % 2;
+                if (bitSequence[i] == 1) onesProportion++;
+            }
+            onesProportion /= totalBits;
 
-        int totalRuns = 1;
-        for (int i = 0; i < totalBits - 1; i++)
-        {
-            if (bitSequence[i] != bitSequence[i + 1]) totalRuns++;
-        }
+            if (Math.Abs(onesProportion - 0.5) >= (2.0 / Math.Sqrt(totalBits)))
+            {
+                return false;
+            }
 
-        double numerator = Math.Abs(totalRuns - (2.0 * totalBits * onesProportion * (1.0 - onesProportion)));
-        double denominator = 2.0 * Math.Sqrt(2.0 * totalBits) * onesProportion * (1.0 - onesProportion);
-        double pValue = NistTests.Erfc(numerator / denominator);
+            int totalRuns = 1;
+            for (int i = 0; i < totalBits - 1; i++)
+            {
+                if (bitSequence[i] != bitSequence[i + 1]) totalRuns++;
+            }
 
-        Assert.True(pValue >= 0.01,
-            $"NIST Runs Failure! Sequence patterns change too fast or too slow. P-Value: {pValue:F6} (Expected >= 0.01). Total Runs: {totalRuns}");
+            double numerator = Math.Abs(totalRuns - (2.0 * totalBits * onesProportion * (1.0 - onesProportion)));
+            double denominator = 2.0 * Math.Sqrt(2.0 * totalBits) * onesProportion * (1.0 - onesProportion);
+            double pValue = NistTests.Erfc(numerator / denominator);
+            return pValue >= SignificanceLevel;
+        }, "NIST Runs Failure! Sequence patterns change too fast or too slow.");
     }
 
     [Fact]
     public void Nist_NextBytes_ApproximateEntropyTest_ShouldPass()
     {
         var generator = FastRng.Instance;
-        const int totalSequences = 100;
         const int n = 100000;
         const int m = 2;
 
-        int passCount = 0;
-
-        for (int s = 0; s < totalSequences; s++)
+        AssertProportionPasses(() =>
         {
             byte[] rawBytes = new byte[n];
             generator.NextBytes(rawBytes);
@@ -196,15 +218,8 @@ public class NextBytesStreamTests
             double zScore = (chiSquared - expectedMean) / Math.Sqrt(expectedVariance);
 
             double pValue = NistTests.Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
-
-            if (pValue >= 0.01) passCount++;
-        }
-
-        const int minimumPassingProportion = 96;
-
-        Assert.True(passCount >= minimumPassingProportion,
-            $"GLI/NIST Approximate Entropy Failure! Proportion of passing sequences is too low. " +
-            $"Got {passCount}/{totalSequences} passing blocks. (NIST Minimum required: {minimumPassingProportion})");
+            return pValue >= SignificanceLevel;
+        }, "GLI/NIST Approximate Entropy Failure!");
     }
 
     [Fact]
@@ -216,41 +231,43 @@ public class NextBytesStreamTests
         const int templateLength = 9;
 
         double lambda = (double)(blockSize - templateLength + 1) / Math.Pow(2, templateLength);
-        int[] matchCounts = new int[totalBlocks];
 
-        for (int b = 0; b < totalBlocks; b++)
+        AssertProportionPasses(() =>
         {
-            byte[] rawBytes = new byte[blockSize];
-            generator.NextBytes(rawBytes);
+            int[] matchCounts = new int[totalBlocks];
 
-            byte[] blockBits = new byte[blockSize];
-            for (int i = 0; i < blockSize; i++) blockBits[i] = (byte)(rawBytes[i] & 1);
-
-            for (int i = 0; i <= blockSize - templateLength; i++)
+            for (int b = 0; b < totalBlocks; b++)
             {
-                if (blockBits[i] == 1 && blockBits[i + 1] == 1 && blockBits[i + 2] == 1 &&
-                    blockBits[i + 3] == 1 && blockBits[i + 4] == 1 && blockBits[i + 5] == 1 &&
-                    blockBits[i + 6] == 1 && blockBits[i + 7] == 1 && blockBits[i + 8] == 1)
+                byte[] rawBytes = new byte[blockSize];
+                generator.NextBytes(rawBytes);
+
+                byte[] blockBits = new byte[blockSize];
+                for (int i = 0; i < blockSize; i++) blockBits[i] = (byte)(rawBytes[i] & 1);
+
+                for (int i = 0; i <= blockSize - templateLength; i++)
                 {
-                    matchCounts[b]++;
-                    i += templateLength - 1;
+                    if (blockBits[i] == 1 && blockBits[i + 1] == 1 && blockBits[i + 2] == 1 &&
+                        blockBits[i + 3] == 1 && blockBits[i + 4] == 1 && blockBits[i + 5] == 1 &&
+                        blockBits[i + 6] == 1 && blockBits[i + 7] == 1 && blockBits[i + 8] == 1)
+                    {
+                        matchCounts[b]++;
+                        i += templateLength - 1;
+                    }
                 }
             }
-        }
 
-        double chiSquaredSum = 0;
-        for (int b = 0; b < totalBlocks; b++)
-        {
-            double deviation = matchCounts[b] - lambda;
-            chiSquaredSum += (deviation * deviation) / lambda;
-        }
+            double chiSquaredSum = 0;
+            for (int b = 0; b < totalBlocks; b++)
+            {
+                double deviation = matchCounts[b] - lambda;
+                chiSquaredSum += (deviation * deviation) / lambda;
+            }
 
-        double expectedMean = totalBlocks;
-        double expectedVariance = 2.0 * totalBlocks;
-        double zScore = (chiSquaredSum - expectedMean) / Math.Sqrt(expectedVariance);
-        double pValue = NistTests.Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
-
-        Assert.True(pValue >= 0.01,
-            $"NIST Template Matching Failure! P-Value: {pValue:F6} (Expected >= 0.01). Chi2: {chiSquaredSum:F2}");
+            double expectedMean = totalBlocks;
+            double expectedVariance = 2.0 * totalBlocks;
+            double zScore = (chiSquaredSum - expectedMean) / Math.Sqrt(expectedVariance);
+            double pValue = NistTests.Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
+            return pValue >= SignificanceLevel;
+        }, "NIST Template Matching Failure!");
     }
 }

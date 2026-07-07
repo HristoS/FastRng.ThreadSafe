@@ -1,14 +1,36 @@
-﻿using Xunit;
+using Xunit;
 
 namespace FastRng.ThreadSafe.Tests
 {
     /// <summary>
     /// Implements native C# representations of the NIST SP 800-22 statistical test suite.
     /// Evaluates generated bitstreams using complementary error functions to calculate mathematical P-values.
+    ///
+    /// Every test here is judged by *pass proportion across many independent trials* rather than a
+    /// single draw. A single-shot check at alpha=0.01 is designed to reject ~1% of genuinely random
+    /// sequences by definition, so gating CI on one draw produces exactly that ~1% nuisance-failure
+    /// rate. NIST SP 800-22 itself recommends judging by the proportion of sequences passing (Section
+    /// 4.2.1); for 100 trials at alpha=0.01 the acceptable range is >=96 passing, which is the
+    /// threshold used throughout this file.
     /// </summary>
     public class NistTests
     {
         private const double SignificanceLevel = 0.01; // NIST standard threshold alpha
+        private const int TotalTrials = 100; // NIST standard sample proportion count
+        private const int MinimumPassingProportion = 96; // NIST SP 800-22 minimum for 100 trials at alpha=0.01
+
+        private static void AssertProportionPasses(Func<bool> trial, string failureLabel)
+        {
+            int passCount = 0;
+            for (int t = 0; t < TotalTrials; t++)
+            {
+                if (trial()) passCount++;
+            }
+
+            Assert.True(passCount >= MinimumPassingProportion,
+                $"{failureLabel} Proportion of passing sequences is too low. " +
+                $"Got {passCount}/{TotalTrials} passing runs. (NIST minimum required: {MinimumPassingProportion})");
+        }
 
         /// <summary>
         /// NIST Test 1: Frequency (Monobit) Test.
@@ -19,29 +41,29 @@ namespace FastRng.ThreadSafe.Tests
         {
             var generator = FastRng.Instance;
 
-            // NIST recommends at least 100,000 bits for reliable evaluation
-            const int totalBits = 200_000;
-            int sum = 0;
-
-            for (int i = 0; i < totalBits; i++)
+            AssertProportionPasses(() =>
             {
-                // Extract a single bit by evaluating if an output byte is even or odd
-                byte sample = generator.NextByte();
-                int bit = sample % 2;
+                // NIST recommends at least 100,000 bits for reliable evaluation
+                const int totalBits = 200_000;
+                int sum = 0;
 
-                // Convert bit: 0 becomes -1, 1 becomes +1
-                sum += (2 * bit) - 1;
-            }
+                for (int i = 0; i < totalBits; i++)
+                {
+                    // Extract a single bit by evaluating if an output byte is even or odd
+                    byte sample = generator.NextByte();
+                    int bit = sample % 2;
 
-            // Calculate the test statistic: S_obs = |sum| / sqrt(n)
-            double sObs = Math.Abs(sum) / Math.Sqrt(totalBits);
+                    // Convert bit: 0 becomes -1, 1 becomes +1
+                    sum += (2 * bit) - 1;
+                }
 
-            // Calculate the P-value using the complementary error function: erfc(S_obs / sqrt(2))
-            double pValue = Erfc(sObs / Math.Sqrt(2.0));
+                // Calculate the test statistic: S_obs = |sum| / sqrt(n)
+                double sObs = Math.Abs(sum) / Math.Sqrt(totalBits);
 
-            // Assert against the NIST threshold (P-value >= 0.01)
-            Assert.True(pValue >= SignificanceLevel,
-                $"NIST Monobit Failure! Bitstream is structurally biased. P-Value: {pValue:F6} (Expected >= 0.01). Bias Sum: {sum}");
+                // Calculate the P-value using the complementary error function: erfc(S_obs / sqrt(2))
+                double pValue = Erfc(sObs / Math.Sqrt(2.0));
+                return pValue >= SignificanceLevel;
+            }, "NIST Monobit Failure! Bitstream is structurally biased.");
         }
 
         /// <summary>
@@ -53,45 +75,46 @@ namespace FastRng.ThreadSafe.Tests
         public void Nist_RunsTest_ShouldPass()
         {
             var generator = FastRng.Instance;
-            const int totalBits = 200_000;
 
-            int[] bitSequence = new int[totalBits];
-            double onesProportion = 0;
-
-            // 1. Gather the sequence and calculate the proportion of ones (pi)
-            for (int i = 0; i < totalBits; i++)
+            AssertProportionPasses(() =>
             {
-                bitSequence[i] = generator.NextByte() % 2;
-                if (bitSequence[i] == 1) onesProportion++;
-            }
-            onesProportion /= totalBits;
+                const int totalBits = 200_000;
 
-            // Prerequisites check: If the frequency test is heavily skewed, the runs test is invalid
-            if (Math.Abs(onesProportion - 0.5) >= (2.0 / Math.Sqrt(totalBits)))
-            {
-                Assert.Fail($"NIST Runs Pre-test skipped/failed: Frequency proportion ({onesProportion:F4}) is too far from 0.5.");
-            }
+                int[] bitSequence = new int[totalBits];
+                double onesProportion = 0;
 
-            // 2. Count the total number of runs (V_n)
-            // A run is an uninterrupted sequence of identical bits.
-            int totalRuns = 1;
-            for (int i = 0; i < totalBits - 1; i++)
-            {
-                if (bitSequence[i] != bitSequence[i + 1])
+                // 1. Gather the sequence and calculate the proportion of ones (pi)
+                for (int i = 0; i < totalBits; i++)
                 {
-                    totalRuns++;
+                    bitSequence[i] = generator.NextByte() % 2;
+                    if (bitSequence[i] == 1) onesProportion++;
                 }
-            }
+                onesProportion /= totalBits;
 
-            // 3. Compute the theoretical expected run metric and calculate the P-value
-            double numerator = Math.Abs(totalRuns - (2.0 * totalBits * onesProportion * (1.0 - onesProportion)));
-            double denominator = 2.0 * Math.Sqrt(2.0 * totalBits) * onesProportion * (1.0 - onesProportion);
+                // Prerequisites check: If the frequency test is heavily skewed, the runs test is invalid
+                if (Math.Abs(onesProportion - 0.5) >= (2.0 / Math.Sqrt(totalBits)))
+                {
+                    return false;
+                }
 
-            double pValue = Erfc(numerator / denominator);
+                // 2. Count the total number of runs (V_n)
+                // A run is an uninterrupted sequence of identical bits.
+                int totalRuns = 1;
+                for (int i = 0; i < totalBits - 1; i++)
+                {
+                    if (bitSequence[i] != bitSequence[i + 1])
+                    {
+                        totalRuns++;
+                    }
+                }
 
-            // Assert against the NIST threshold (P-value >= 0.01)
-            Assert.True(pValue >= SignificanceLevel,
-                $"NIST Runs Failure! Sequence patterns change too fast or too slow. P-Value: {pValue:F6} (Expected >= 0.01). Total Runs: {totalRuns}");
+                // 3. Compute the theoretical expected run metric and calculate the P-value
+                double numerator = Math.Abs(totalRuns - (2.0 * totalBits * onesProportion * (1.0 - onesProportion)));
+                double denominator = 2.0 * Math.Sqrt(2.0 * totalBits) * onesProportion * (1.0 - onesProportion);
+
+                double pValue = Erfc(numerator / denominator);
+                return pValue >= SignificanceLevel;
+            }, "NIST Runs Failure! Sequence patterns change too fast or too slow.");
         }
 
         /// <summary>
@@ -103,13 +126,10 @@ namespace FastRng.ThreadSafe.Tests
         public void Nist_ApproximateEntropyTest_ShouldPass()
         {
             var generator = FastRng.Instance;
-            const int totalSequences = 100; // NIST standard sample proportion count
-            const int n = 100000;          // 100,000 bits per sequence
-            const int m = 2;               // Recommended block length for 100k bits
+            const int n = 100000; // 100,000 bits per sequence
+            const int m = 2;      // Recommended block length for 100k bits
 
-            int passCount = 0;
-
-            for (int s = 0; s < totalSequences; s++)
+            AssertProportionPasses(() =>
             {
                 // 1. Gather bitstream for current block sequence
                 byte[] bits = new byte[n];
@@ -131,22 +151,9 @@ namespace FastRng.ThreadSafe.Tests
                 double expectedVariance = 2.0 * expectedMean;
                 double zScore = (chiSquared - expectedMean) / Math.Sqrt(expectedVariance);
 
-                double pValue = NistTests.Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
-
-                // Track individual sequence successes
-                if (pValue >= SignificanceLevel)
-                {
-                    passCount++;
-                }
-            }
-
-            // NIST SP 800-22 Criteria: For 100 sequences at Alpha = 0.01,
-            // the minimum acceptable passing proportion is 96 sequences.
-            const int minimumPassingProportion = 96;
-
-            Assert.True(passCount >= minimumPassingProportion,
-                $"GLI/NIST Approximate Entropy Failure! Proportion of passing sequences is too low. " +
-                $"Got {passCount}/{totalSequences} passing blocks. (NIST Minimum required: {minimumPassingProportion})");
+                double pValue = Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
+                return pValue >= SignificanceLevel;
+            }, "GLI/NIST Approximate Entropy Failure!");
         }
 
         /// <summary>
@@ -165,51 +172,51 @@ namespace FastRng.ThreadSafe.Tests
             // Mean expected matches per block (NIST Formula: lambda = (M - m + 1) / 2^m)
             double lambda = (double)(blockSize - templateLength + 1) / Math.Pow(2, templateLength); // ~1.9375
 
-            int[] matchCounts = new int[totalBlocks];
-
-            // 1. Collect bit streams and execute non-overlapping template search
-            for (int b = 0; b < totalBlocks; b++)
+            AssertProportionPasses(() =>
             {
-                byte[] blockBits = new byte[blockSize];
-                for (int i = 0; i < blockSize; i++)
-                {
-                    blockBits[i] = (byte)(generator.NextByte() & 1);
-                }
+                int[] matchCounts = new int[totalBlocks];
 
-                for (int i = 0; i <= blockSize - templateLength; i++)
+                // 1. Collect bit streams and execute non-overlapping template search
+                for (int b = 0; b < totalBlocks; b++)
                 {
-                    // Scanning for bit template "111111111"
-                    if (blockBits[i] == 1 && blockBits[i + 1] == 1 && blockBits[i + 2] == 1 &&
-                        blockBits[i + 3] == 1 && blockBits[i + 4] == 1 && blockBits[i + 5] == 1 &&
-                        blockBits[i + 6] == 1 && blockBits[i + 7] == 1 && blockBits[i + 8] == 1)
+                    byte[] blockBits = new byte[blockSize];
+                    for (int i = 0; i < blockSize; i++)
                     {
-                        matchCounts[b]++;
-                        i += templateLength - 1; // Slide past the matched template window
+                        blockBits[i] = (byte)(generator.NextByte() & 1);
+                    }
+
+                    for (int i = 0; i <= blockSize - templateLength; i++)
+                    {
+                        // Scanning for bit template "111111111"
+                        if (blockBits[i] == 1 && blockBits[i + 1] == 1 && blockBits[i + 2] == 1 &&
+                            blockBits[i + 3] == 1 && blockBits[i + 4] == 1 && blockBits[i + 5] == 1 &&
+                            blockBits[i + 6] == 1 && blockBits[i + 7] == 1 && blockBits[i + 8] == 1)
+                        {
+                            matchCounts[b]++;
+                            i += templateLength - 1; // Slide past the matched template window
+                        }
                     }
                 }
-            }
 
-            // 2. Compute Chi-Square statistic using standard empirical distribution matching
-            double chiSquaredSum = 0;
-            for (int b = 0; b < totalBlocks; b++)
-            {
-                // For a Poisson distribution where mean == variance == lambda
-                double deviation = matchCounts[b] - lambda;
-                chiSquaredSum += (deviation * deviation) / lambda;
-            }
+                // 2. Compute Chi-Square statistic using standard empirical distribution matching
+                double chiSquaredSum = 0;
+                for (int b = 0; b < totalBlocks; b++)
+                {
+                    // For a Poisson distribution where mean == variance == lambda
+                    double deviation = matchCounts[b] - lambda;
+                    chiSquaredSum += (deviation * deviation) / lambda;
+                }
 
-            // 3. Under NIST SP 800-22, the P-value for this specific sum distribution
-            // is calculated using the upper incomplete gamma function. For degrees of freedom = totalBlocks,
-            // a highly accurate normal approximation for erfc is:
-            double expectedMean = totalBlocks;
-            double expectedVariance = 2.0 * totalBlocks;
-            double zScore = (chiSquaredSum - expectedMean) / Math.Sqrt(expectedVariance);
+                // 3. Under NIST SP 800-22, the P-value for this specific sum distribution
+                // is calculated using the upper incomplete gamma function. For degrees of freedom = totalBlocks,
+                // a highly accurate normal approximation for erfc is:
+                double expectedMean = totalBlocks;
+                double expectedVariance = 2.0 * totalBlocks;
+                double zScore = (chiSquaredSum - expectedMean) / Math.Sqrt(expectedVariance);
 
-            // Calculate final P-value
-            double pValue = Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
-
-            Assert.True(pValue >= SignificanceLevel,
-                $"NIST Template Matching Failure! P-Value: {pValue:F6} (Expected >= {SignificanceLevel}). Chi2: {chiSquaredSum:F2}");
+                double pValue = Erfc(Math.Abs(zScore) / Math.Sqrt(2.0));
+                return pValue >= SignificanceLevel;
+            }, "NIST Template Matching Failure!");
         }
 
         /// <summary>

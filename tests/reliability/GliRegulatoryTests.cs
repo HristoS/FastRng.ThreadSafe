@@ -152,32 +152,51 @@ namespace FastRng.ThreadSafe.Tests
                 $"GLI Security Failure! Output streams reveal heavy algebraic linearity ({dependencyRatio:P2}). State is predictable.");
         }
 
+        /// <summary>
+        /// A single trial's 2% deviation cap sits at only ~3.3 standard deviations from the
+        /// binomial mean, and with 37 buckets checked per trial that's roughly a 3% chance of a
+        /// spurious failure even for a perfectly unbiased generator. Requiring 8/10 independent
+        /// trials to pass (rather than gating on a single 1,000,000-spin draw) keeps the same
+        /// bias-detection sensitivity while cutting CI nuisance-failures to a negligible rate.
+        /// </summary>
         [Fact]
         public void Test_Strict_Modulo_Bias_Elimination()
         {
-            // Arrange: Define a non-power-of-two range to maximize modulo bias stress
-            int minValue = 0;
-            int maxValue = 37; // 37 numbers (0 to 36 - Roulette)
-            int totalSpins = 1_000_000;
-            int[] frequencies = new int[maxValue];
+            const int minValue = 0;
+            const int maxValue = 37; // 37 numbers (0 to 36 - Roulette)
+            const int totalSpins = 1_000_000;
+            const int totalTrials = 10;
+            const int minimumPassingTrials = 8;
 
-            // Act
-            for (int i = 0; i < totalSpins; i++)
-            {
-                int spin = FastRng.Instance.Next(minValue, maxValue);
-                frequencies[spin]++;
-            }
-
-            // Assert: Check the exact deviation between the most frequent and least frequent numbers
             double expectedFrequency = (double)totalSpins / maxValue;
             double maxAllowedDeviation = expectedFrequency * 0.02; // Strict 2% variance max limit
 
-            for (int i = 0; i < maxValue; i++)
+            int passCount = 0;
+            for (int t = 0; t < totalTrials; t++)
             {
-                double deviation = Math.Abs(frequencies[i] - expectedFrequency);
-                Assert.True(deviation < maxAllowedDeviation,
-                    $"Value {i} outside acceptable regulatory tolerance. Expected ~{expectedFrequency:F0}, got {frequencies[i]}. Deviation: {deviation:F0}");
+                int[] frequencies = new int[maxValue];
+                for (int i = 0; i < totalSpins; i++)
+                {
+                    int spin = FastRng.Instance.Next(minValue, maxValue);
+                    frequencies[spin]++;
+                }
+
+                bool trialPassed = true;
+                for (int i = 0; i < maxValue; i++)
+                {
+                    if (Math.Abs(frequencies[i] - expectedFrequency) >= maxAllowedDeviation)
+                    {
+                        trialPassed = false;
+                        break;
+                    }
+                }
+
+                if (trialPassed) passCount++;
             }
+
+            Assert.True(passCount >= minimumPassingTrials,
+                $"Modulo bias detected across repeated trials. Got {passCount}/{totalTrials} passing trials " +
+                $"(minimum required: {minimumPassingTrials}).");
         }
 
         /// <summary>
